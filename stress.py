@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
 Script d'analyse des données de stress Garmin
-Usage: python stress.py --ma 7 --draw all --source ./DI_CONNECT/DI-Connect-Aggregator
+Usage:
+  Mode normal (toutes les données) : python stress.py --ma 7 --draw all --source ./DI_CONNECT/DI-Connect-Aggregator
+  Mode range : python stress.py --ma 7 --range 2024-12-31,-90 --source ./DI_CONNECT/DI-Connect-Aggregator
+  Mode comparaison : python stress.py --ma 7 --compare 2024-01-01,2025-01-01,90 --source ./DI_CONNECT/DI-Connect-Aggregator
+
+  Note: Les longueurs négatives comptent en arrière depuis la date de référence
 """
 
 import argparse
@@ -23,7 +28,9 @@ def parse_arguments():
     parser.add_argument('--draw', type=str, default='all',
                         help='Lignes à dessiner: all, sleep, awake, avg, ou combinaison séparée par des virgules (ex: sleep,awake)')
     parser.add_argument('--compare', type=str, default=None,
-                        help='Comparer des périodes: START_DAY_1,START_DAY_2,LENGTH (format: YYYY-MM-DD,YYYY-MM-DD,30)')
+                        help='Comparer des périodes: START_DAY_1,START_DAY_2,LENGTH (format: YYYY-MM-DD,YYYY-MM-DD,30 ou YYYY-MM-DD,YYYY-MM-DD,-90 pour 90j en arrière)')
+    parser.add_argument('--range', type=str, default=None,
+                        help='Filtrer une période spécifique: START_DAY,LENGTH (format: YYYY-MM-DD,30 ou YYYY-MM-DD,-90 pour 90j en arrière)')
     parser.add_argument('--source', type=str, required=True,
                         help='Dossier contenant les fichiers UDSFile_*.json')
     return parser.parse_args()
@@ -137,15 +144,29 @@ def apply_moving_average(df, window):
     return df
 
 
-def filter_period(df, start_date, length_days):
-    """Filtre le dataframe pour une période donnée"""
-    start = pd.to_datetime(start_date)
-    end = start + timedelta(days=length_days)
+def filter_period(df, reference_date, length_days):
+    """
+    Filtre le dataframe pour une période donnée
+    Si length_days > 0: période de reference_date à reference_date + length_days
+    Si length_days < 0: période de reference_date + length_days à reference_date
+    Retourne: (filtered_df, start_date, end_date)
+    """
+    reference = pd.to_datetime(reference_date)
+
+    if length_days >= 0:
+        # Mode normal: on avance dans le temps
+        start = reference
+        end = reference + timedelta(days=length_days)
+    else:
+        # Mode arrière: on recule dans le temps
+        start = reference + timedelta(days=length_days)  # length_days est négatif, donc on recule
+        end = reference
+
     mask = (df['date'] >= start) & (df['date'] < end)
     filtered = df[mask].copy()
     # Créer une colonne 'day_offset' pour l'alignement des comparaisons
     filtered['day_offset'] = (filtered['date'] - start).dt.days
-    return filtered
+    return filtered, start, end
 
 
 def print_statistics(df, period_name=None):
@@ -437,10 +458,11 @@ def main():
             if len(parts) != 3:
                 raise ValueError("Format attendu: START_DAY_1,START_DAY_2,LENGTH")
 
-            start1, start2, length = parts[0].strip(), parts[1].strip(), int(parts[2].strip())
+            ref1, ref2, length = parts[0].strip(), parts[1].strip(), int(parts[2].strip())
 
-            period1 = filter_period(df, start1, length)
-            period2 = filter_period(df, start2, length)
+            # Filtrer les périodes et obtenir les dates de début/fin
+            period1, start1, end1 = filter_period(df, ref1, length)
+            period2, start2, end2 = filter_period(df, ref2, length)
 
             if period1.empty or period2.empty:
                 print("❌ Une ou plusieurs périodes n'ont pas de données")
@@ -448,10 +470,10 @@ def main():
 
             # Afficher les périodes avec début et fin
             print("\n📅 Périodes comparées:")
-            end1 = pd.to_datetime(start1) + timedelta(days=length - 1)
-            end2 = pd.to_datetime(start2) + timedelta(days=length - 1)
-            print(f"   Période 1: {start1} → {end1.strftime('%Y-%m-%d')} ({length} jours)")
-            print(f"   Période 2: {start2} → {end2.strftime('%Y-%m-%d')} ({length} jours)")
+            print(
+                f"   Période 1: {start1.strftime('%Y-%m-%d')} → {(end1 - timedelta(days=1)).strftime('%Y-%m-%d')} ({abs(length)} jours)")
+            print(
+                f"   Période 2: {start2.strftime('%Y-%m-%d')} → {(end2 - timedelta(days=1)).strftime('%Y-%m-%d')} ({abs(length)} jours)")
 
             period_names = [
                 f"Période 1",
@@ -459,8 +481,8 @@ def main():
             ]
 
             period_dates = [
-                (start1, end1.strftime('%Y-%m-%d')),
-                (start2, end2.strftime('%Y-%m-%d'))
+                (start1.strftime('%Y-%m-%d'), (end1 - timedelta(days=1)).strftime('%Y-%m-%d')),
+                (start2.strftime('%Y-%m-%d'), (end2 - timedelta(days=1)).strftime('%Y-%m-%d'))
             ]
 
             print("\n📉 Génération du graphique...")
@@ -476,6 +498,30 @@ def main():
             sys.exit(1)
     else:
         # Mode normal
+        # Vérifier si on a un range spécifié
+        if args.range:
+            print("\n📅 Mode range activé")
+            try:
+                parts = args.range.split(',')
+                if len(parts) != 2:
+                    raise ValueError("Format attendu: START_DAY,LENGTH")
+
+                ref_date, length = parts[0].strip(), int(parts[1].strip())
+                df, start, end = filter_period(df, ref_date, length)
+
+                if df.empty:
+                    print("❌ Aucune donnée dans la période spécifiée")
+                    sys.exit(1)
+
+                print(
+                    f"📊 Période sélectionnée: {start.strftime('%Y-%m-%d')} → {(end - timedelta(days=1)).strftime('%Y-%m-%d')} ({abs(length)} jours)")
+
+            except Exception as e:
+                print(f"❌ Erreur lors du filtrage de la période: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+
         print("\n📉 Génération du graphique...")
         fig = plot_stress_data(df, args.ma, args.draw)
 
