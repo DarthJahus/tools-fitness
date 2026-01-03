@@ -192,39 +192,48 @@ def plot_comparison(periods_data, ma_window, draw_options, period_names):
     draw_all = draw_options == 'all'
     draw_list = draw_options.split(',') if not draw_all else ['sleep', 'awake', 'avg']
 
-    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6']
+    # Palette de couleurs par type de stress et par période
+    # Période 1: teintes claires, Période 2: teintes foncées, etc.
+    color_palettes = {
+        'sleep': ['#5DADE2', '#1F618D', '#85C1E9', '#154360'],  # Bleus
+        'awake': ['#EC7063', '#922B21', '#F1948A', '#641E16'],  # Rouges
+        'avg': ['#52BE80', '#196F3D', '#7DCEA0', '#0E4429']  # Verts
+    }
+
     line_styles = ['-', '--', '-.', ':']
 
     for idx, (period_df, period_name) in enumerate(zip(periods_data, period_names)):
-        color = colors[idx % len(colors)]
         linestyle = line_styles[idx % len(line_styles)]
 
         # Dessiner les données brutes puis la moyenne mobile
         if draw_all or 'sleep' in draw_list:
+            color_sleep = color_palettes['sleep'][idx % len(color_palettes['sleep'])]
             if 'sleep' in period_df.columns:
                 ax.plot(period_df['day_offset'], period_df['sleep'],
-                        color=color, linestyle=linestyle, linewidth=0.8, alpha=0.25)
+                        color=color_sleep, linestyle=linestyle, linewidth=0.8, alpha=0.25)
             if 'sleep_ma' in period_df.columns:
                 ax.plot(period_df['day_offset'], period_df['sleep_ma'],
-                        color=color, linestyle=linestyle, linewidth=2.5,
+                        color=color_sleep, linestyle=linestyle, linewidth=2.5,
                         label=f'{period_name} - Sommeil', alpha=0.8)
 
         if draw_all or 'awake' in draw_list:
+            color_awake = color_palettes['awake'][idx % len(color_palettes['awake'])]
             if 'awake' in period_df.columns:
                 ax.plot(period_df['day_offset'], period_df['awake'],
-                        color=color, linestyle=linestyle, linewidth=0.8, alpha=0.25)
+                        color=color_awake, linestyle=linestyle, linewidth=0.8, alpha=0.25)
             if 'awake_ma' in period_df.columns:
                 ax.plot(period_df['day_offset'], period_df['awake_ma'],
-                        color=color, linestyle=linestyle, linewidth=2.5,
+                        color=color_awake, linestyle=linestyle, linewidth=2.5,
                         label=f'{period_name} - Éveillé', alpha=0.8)
 
         if draw_all or 'avg' in draw_list:
+            color_avg = color_palettes['avg'][idx % len(color_palettes['avg'])]
             if 'total' in period_df.columns:
                 ax.plot(period_df['day_offset'], period_df['total'],
-                        color=color, linestyle=linestyle, linewidth=0.8, alpha=0.25)
+                        color=color_avg, linestyle=linestyle, linewidth=0.8, alpha=0.25)
             if 'total_ma' in period_df.columns:
                 ax.plot(period_df['day_offset'], period_df['total_ma'],
-                        color=color, linestyle=linestyle, linewidth=2.5,
+                        color=color_avg, linestyle=linestyle, linewidth=2.5,
                         label=f'{period_name} - Moyen', alpha=0.8)
 
     ax.set_xlabel('Jours depuis le début de la période', fontsize=12, fontweight='bold')
