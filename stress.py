@@ -102,7 +102,9 @@ def apply_moving_average(df, window):
     if window > 1:
         for col in ['total', 'awake', 'sleep']:
             if col in df.columns:
-                df[f'{col}_ma'] = df[col].rolling(window=window, center=False).mean()
+                # min_periods=1 permet de continuer la MA même avec des données manquantes
+                # Elle sera calculée sur les valeurs disponibles dans la fenêtre
+                df[f'{col}_ma'] = df[col].rolling(window=window, center=False, min_periods=1).mean()
     else:
         for col in ['total', 'awake', 'sleep']:
             if col in df.columns:
