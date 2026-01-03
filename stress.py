@@ -123,6 +123,70 @@ def filter_period(df, start_date, length_days):
     return filtered
 
 
+def print_statistics(df, period_name=None):
+    """Affiche les statistiques pour une période et retourne les moyennes"""
+    prefix = f"   [{period_name}] " if period_name else "   "
+
+    stats = {}
+    if 'total' in df.columns and df['total'].notna().any():
+        stats['total'] = df['total'].mean()
+        print(f"{prefix}Stress moyen (total): {stats['total']:.1f}")
+    if 'awake' in df.columns and df['awake'].notna().any():
+        stats['awake'] = df['awake'].mean()
+        print(f"{prefix}Stress moyen (éveillé): {stats['awake']:.1f}")
+    if 'sleep' in df.columns and df['sleep'].notna().any():
+        stats['sleep'] = df['sleep'].mean()
+        print(f"{prefix}Stress moyen (sommeil): {stats['sleep']:.1f}")
+
+    return stats
+
+
+def print_comparison_statistics(period1_df, period2_df):
+    """Affiche les statistiques comparées entre deux périodes"""
+    print("\n📊 Statistiques comparées:")
+
+    # Calculer les moyennes
+    stats1 = {}
+    stats2 = {}
+
+    if 'total' in period1_df.columns and period1_df['total'].notna().any():
+        stats1['total'] = period1_df['total'].mean()
+    if 'total' in period2_df.columns and period2_df['total'].notna().any():
+        stats2['total'] = period2_df['total'].mean()
+
+    if 'awake' in period1_df.columns and period1_df['awake'].notna().any():
+        stats1['awake'] = period1_df['awake'].mean()
+    if 'awake' in period2_df.columns and period2_df['awake'].notna().any():
+        stats2['awake'] = period2_df['awake'].mean()
+
+    if 'sleep' in period1_df.columns and period1_df['sleep'].notna().any():
+        stats1['sleep'] = period1_df['sleep'].mean()
+    if 'sleep' in period2_df.columns and period2_df['sleep'].notna().any():
+        stats2['sleep'] = period2_df['sleep'].mean()
+
+    # Afficher les comparaisons
+    if 'total' in stats1 and 'total' in stats2:
+        diff = stats2['total'] - stats1['total']
+        sign = '+' if diff >= 0 else ''
+        print(f"   Stress moyen (total):")
+        print(f"      Période 1: {stats1['total']:.1f}")
+        print(f"      Période 2: {stats2['total']:.1f} ({sign}{diff:.1f})")
+
+    if 'awake' in stats1 and 'awake' in stats2:
+        diff = stats2['awake'] - stats1['awake']
+        sign = '+' if diff >= 0 else ''
+        print(f"   Stress moyen (éveillé):")
+        print(f"      Période 1: {stats1['awake']:.1f}")
+        print(f"      Période 2: {stats2['awake']:.1f} ({sign}{diff:.1f})")
+
+    if 'sleep' in stats1 and 'sleep' in stats2:
+        diff = stats2['sleep'] - stats1['sleep']
+        sign = '+' if diff >= 0 else ''
+        print(f"   Stress moyen (sommeil):")
+        print(f"      Période 1: {stats1['sleep']:.1f}")
+        print(f"      Période 2: {stats2['sleep']:.1f} ({sign}{diff:.1f})")
+
+
 def plot_stress_data(df, ma_window, draw_options, title="Évolution du stress"):
     """Génère le graphique de stress"""
     fig, ax = plt.subplots(figsize=(15, 7))
@@ -171,21 +235,39 @@ def plot_stress_data(df, ma_window, draw_options, title="Évolution du stress"):
     # Formatage
     ax.set_xlabel('Date', fontsize=12, fontweight='bold')
     ax.set_ylabel('Niveau de stress', fontsize=12, fontweight='bold')
-    ax.set_title(f'{title}\n(Moyenne mobile sur {ma_window} jours)',
-                 fontsize=14, fontweight='bold', pad=20)
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
     ax.legend(loc='upper left', fontsize=11)
     ax.grid(True, alpha=0.3, linestyle='--')
 
-    # Format des dates
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    # Ajouter l'info de moyenne mobile en petit en bas à droite
+    ax.text(0.99, 0.01, f'Moyenne mobile: {ma_window} jours',
+            transform=ax.transAxes, fontsize=9,
+            verticalalignment='bottom', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+
+    # Format de l'axe des X selon la durée
+    date_range = (df['date'].max() - df['date'].min()).days
+
+    if date_range > 90:  # Plus de 3 mois : graduations tous les 30 jours
+        # Créer des ticks tous les 30 jours
+        date_ticks = pd.date_range(start=df['date'].min(), end=df['date'].max(), freq='30D')
+        ax.set_xticks(date_ticks)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        # Colorer les labels en noir (mode normal)
+        for label in ax.get_xticklabels():
+            label.set_color('black')
+    else:  # 3 mois ou moins : graduations tous les 7 jours
+        date_ticks = pd.date_range(start=df['date'].min(), end=df['date'].max(), freq='7D')
+        ax.set_xticks(date_ticks)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
     plt.xticks(rotation=45, ha='right')
 
     plt.tight_layout()
     return fig
 
 
-def plot_comparison(periods_data, ma_window, draw_options, period_names):
+def plot_comparison(periods_data, ma_window, draw_options, period_names, period_dates):
     """Génère un graphique de comparaison entre périodes"""
     fig, ax = plt.subplots(figsize=(15, 7))
 
@@ -238,11 +320,50 @@ def plot_comparison(periods_data, ma_window, draw_options, period_names):
 
     ax.set_xlabel('Jours depuis le début de la période', fontsize=12, fontweight='bold')
     ax.set_ylabel('Niveau de stress', fontsize=12, fontweight='bold')
-    ax.set_title(f'Comparaison des périodes\n(Moyenne mobile sur {ma_window} jours)',
-                 fontsize=14, fontweight='bold', pad=20)
+    ax.set_title('Comparaison des périodes', fontsize=14, fontweight='bold', pad=20)
     ax.legend(loc='upper left', fontsize=10, ncol=2)
     ax.grid(True, alpha=0.3, linestyle='--')
 
+    # Créer un encart avec les informations sur les périodes
+    period_info_text = f"Moyenne mobile: {ma_window} jours\n\n"
+    for idx, (start, end) in enumerate(period_dates, 1):
+        period_info_text += f"Période {idx}: {start} → {end}\n"
+
+    ax.text(0.99, 0.01, period_info_text.strip(),
+            transform=ax.transAxes, fontsize=9,
+            verticalalignment='bottom', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Déterminer la durée maximale pour l'axe X
+    max_days = max(df['day_offset'].max() for df in periods_data if not df.empty)
+
+    if max_days > 90:  # Plus de 3 mois : graduations tous les 30 jours
+        # Créer des ticks tous les 30 jours
+        x_ticks = list(range(0, int(max_days) + 1, 30))
+        ax.set_xticks(x_ticks)
+
+        # Créer des labels avec mois-année pour chaque période
+        tick_labels = []
+        for tick in x_ticks:
+            labels_for_tick = []
+            for idx, (start_date, _) in enumerate(period_dates):
+                date_at_tick = pd.to_datetime(start_date) + timedelta(days=tick)
+                month_year = date_at_tick.strftime('%b %Y')
+                labels_for_tick.append(month_year)
+            # Joindre les labels de toutes les périodes
+            tick_labels.append('\n'.join(labels_for_tick))
+
+        ax.set_xticklabels(tick_labels)
+
+        # Mettre tous les labels en noir
+        for label in ax.get_xticklabels():
+            label.set_color('black')
+    else:  # 3 mois ou moins : graduations tous les 7 jours
+        x_ticks = list(range(0, int(max_days) + 1, 7))
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels([f'J{tick}' for tick in x_ticks])
+
+    plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     return fig
 
@@ -290,32 +411,45 @@ def main():
                 print("❌ Une ou plusieurs périodes n'ont pas de données")
                 sys.exit(1)
 
+            # Afficher les périodes avec début et fin
+            print("\n📅 Périodes comparées:")
+            end1 = pd.to_datetime(start1) + timedelta(days=length - 1)
+            end2 = pd.to_datetime(start2) + timedelta(days=length - 1)
+            print(f"   Période 1: {start1} → {end1.strftime('%Y-%m-%d')} ({length} jours)")
+            print(f"   Période 2: {start2} → {end2.strftime('%Y-%m-%d')} ({length} jours)")
+
             period_names = [
-                f"Période 1: {start1}",
-                f"Période 2: {start2}"
+                f"Période 1",
+                f"Période 2"
             ]
 
-            fig = plot_comparison([period1, period2], args.ma, args.draw, period_names)
+            period_dates = [
+                (start1, end1.strftime('%Y-%m-%d')),
+                (start2, end2.strftime('%Y-%m-%d'))
+            ]
+
+            print("\n📉 Génération du graphique...")
+            fig = plot_comparison([period1, period2], args.ma, args.draw, period_names, period_dates)
+
+            # Statistiques comparées
+            print_comparison_statistics(period1, period2)
 
         except Exception as e:
             print(f"❌ Erreur lors de la comparaison: {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     else:
         # Mode normal
         print("\n📉 Génération du graphique...")
         fig = plot_stress_data(df, args.ma, args.draw)
 
+        # Statistiques
+        print("\n📊 Statistiques:")
+        print_statistics(df)
+
     print("\n✨ Graphique généré ! Affichage...")
     plt.show()
-
-    # Statistiques
-    print("\n📊 Statistiques:")
-    if 'total_ma' in df.columns:
-        print(f"   Stress moyen (total): {df['total'].mean():.1f}")
-    if 'awake_ma' in df.columns:
-        print(f"   Stress moyen (éveillé): {df['awake'].mean():.1f}")
-    if 'sleep_ma' in df.columns:
-        print(f"   Stress moyen (sommeil): {df['sleep'].mean():.1f}")
 
 
 if __name__ == '__main__':
