@@ -97,6 +97,31 @@ def extract_stress_data(raw_data):
     return pd.DataFrame(stress_data).sort_values('date').reset_index(drop=True)
 
 
+def detect_data_gaps(df, min_gap_days=3):
+    """Détecte les trous dans les données (périodes sans données consécutives)"""
+    if df.empty or len(df) < 2:
+        return []
+
+    gaps = []
+    dates = df['date'].sort_values().reset_index(drop=True)
+
+    for i in range(len(dates) - 1):
+        current_date = dates[i]
+        next_date = dates[i + 1]
+        gap_days = (next_date - current_date).days - 1  # -1, car on veut le nombre de jours entre les deux
+
+        if gap_days >= min_gap_days:
+            gap_start = current_date + timedelta(days=1)
+            gap_end = next_date - timedelta(days=1)
+            gaps.append({
+                'start': gap_start,
+                'end': gap_end,
+                'days': gap_days
+            })
+
+    return gaps
+
+
 def apply_moving_average(df, window):
     """Applique une moyenne mobile aux données de stress"""
     if window > 1:
@@ -389,6 +414,16 @@ def main():
         sys.exit(1)
 
     print(f"✅ Données extraites: {df['date'].min().strftime('%Y-%m-%d')} à {df['date'].max().strftime('%Y-%m-%d')}")
+
+    # Détecter les trous dans les données
+    gaps = detect_data_gaps(df, min_gap_days=4)
+    if gaps:
+        print("\n⚠️  Trous détectés dans les données:")
+        for gap in gaps:
+            print(
+                f"   - Du {gap['start'].strftime('%Y-%m-%d')} au {gap['end'].strftime('%Y-%m-%d')} ({gap['days']} jours manquants)")
+    else:
+        print("\n✅ Aucun trou significatif détecté dans les données")
 
     # Appliquer la moyenne mobile
     print(f"\n📈 Application de la moyenne mobile sur {args.ma} jours...")
