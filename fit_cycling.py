@@ -10,7 +10,7 @@ Usage:
     python fit_cycling.py <file.fit> --effort-method hrtss
 """
 
-# ToDo: Make sure the turning point is correctly detected
+# Done: Make sure the turning point is correctly detected
 # ToDo? Improve the custom formula for effort
 # ToDo: Test it with multiple .FIT files
 
@@ -22,6 +22,7 @@ import seaborn as sns
 from mpl_toolkits.mplot3d import Axes3D  # ToDo: Use or remove
 from scipy.signal import argrelextrema
 from scipy.spatial.distance import cdist
+from scipy.ndimage import gaussian_filter1d
 import argparse
 import sys
 from pathlib import Path
@@ -35,7 +36,7 @@ EXTREMA_ORDER = 30  # Window for local min/max detection
 EDGE_PERCENT = 0.05  # Edge percentage for turnaround detection
 SEMICIRCLES_TO_DEGREES = 180.0 / 2 ** 31  # FIT file coordinate conversion
 OVERLAP_THRESHOLD = 0.0001  # ~11 meters in degrees
-MIN_OVERLAP_POINTS = 30
+MIN_OVERLAP_POINTS = 20
 HEADING_WINDOW = 10
 
 # hrTSS multipliers per zone (TSS per hour)
@@ -341,85 +342,65 @@ def prepare_data(df, has_gps=True, slope_bounds=SLOPE_BOUNDS_DEFAULT):
     return df
 
 
-def calculate_effort_custom(df, zone_boundaries, resting_hr=None):
-    """
-    Zone-aware custom effort calculation.
-    Uses HR zones as primary intensity, with slope and speed as modifiers.
-    """
-    # Assign HR zones
+def calculate_effort_custom(df, zone_boundaries, smooth=True):
+    """Zone-aware custom effort calculation (instantaneous, smoothed)."""
     df["hr_zone"] = df["heart_rate"].apply(
         lambda hr: get_hr_zone_number(hr, zone_boundaries)
     )
 
-    # Base intensity from zone (exponential scaling)
     zone_intensity = df["hr_zone"].map(ZONE_INTENSITY)
-
-    # Slope modifier: climbing is harder, descending is easier
-    # ±10% slope = ±40% effort change
     slope_modifier = 1 + (df["slope_clipped"] / 10) * 0.4
     slope_modifier = slope_modifier.clip(0.5, 2.0)
 
-    # Speed modifier: higher speed = wind resistance
-    # Normalized to typical cycling speeds (25 km/h baseline)
     speed_baseline = 25.0
     speed_ratio = (df["speed_kmh"] / speed_baseline).clip(0.1, 3.0)
     speed_modifier = 0.8 + 0.2 * (speed_ratio ** 1.5)
 
-    # Combined effort per second
-    effort_per_second = zone_intensity * slope_modifier * speed_modifier * 30
+    effort = zone_intensity * slope_modifier * speed_modifier * 50
 
-    # Cumulative effort
-    return effort_per_second.cumsum()
+    # Smooth with rolling mean (15 second window)
+    if smooth:
+        effort = effort.rolling(window=15, center=True, min_periods=1).mean()
+
+    return effort
 
 
-def calculate_effort_hrtss(df, zone_boundaries):
-    """
-    Calculate heart rate based Training Stress Score (hrTSS).
-    Based on time spent in each HR zone.
-    """
-    # Assign zones
+def calculate_effort_hrtss(df, zone_boundaries, smooth=True):
+    """Calculate hrTSS rate (instantaneous, not cumulative, smoothed)."""
     df["hr_zone"] = df["heart_rate"].apply(
         lambda hr: get_hr_zone_number(hr, zone_boundaries)
     )
 
-    # Calculate TSS per second based on zone
-    df["tss_per_second"] = df["hr_zone"].map(
-        lambda z: HRTSS_ZONE_MULTIPLIERS.get(z, 20) / 3600.0
+    # TSS rate per hour (instantaneous)
+    effort = df["hr_zone"].map(
+        lambda z: HRTSS_ZONE_MULTIPLIERS.get(z, 20)
     )
 
-    # Cumulative TSS
-    effort = df["tss_per_second"].cumsum()
+    # Smooth with rolling mean (15 second window)
+    if smooth:
+        effort = effort.rolling(window=15, center=True, min_periods=1).mean()
 
     return effort
 
 
 def calculate_effort_tss(df, ftp=None):
-    """
-    Calculate Training Stress Score (TSS) from power data.
-    Falls back to hrTSS if power data unavailable.
-    """
+    """Calculate TSS rate from power (instantaneous, not cumulative)."""
     if "power" not in df.columns or df["power"].isna().all():
         print("Warning: No power data available, falling back to hrTSS")
         return None
 
-    # If FTP not provided, estimate as 95% of 20-min max power
     if ftp is None:
-        # Simple estimation: use 75th percentile of power
         ftp = df["power"].dropna().quantile(0.75)
-        print(f"Info: Estimated FTP = {ftp:.0f}W (adjust with --ftp if needed)")
+        print(f"Info: Estimated FTP = {ftp:.0f}W")
 
-    # Normalized Power (simplified: 30s rolling mean to 4th power)
     rolling_power = df["power"].rolling(window=30, min_periods=1).mean()
     np_power = (rolling_power ** 4).rolling(window=30, min_periods=1).mean() ** 0.25
-
-    # Intensity Factor
     intensity_factor = np_power / ftp
 
-    # TSS calculation
-    duration_hours = df["time_s"] / 3600.0
-    tss = (df["time_s"] * np_power * intensity_factor) / (ftp * 3600) * 100
+    # TSS rate (instantaneous)
+    tss_rate = (np_power * intensity_factor) / (ftp * 36)
 
-    return tss.cumsum()
+    return tss_rate
 
 
 def calculate_heading(lat1, lon1, lat2, lon2):
@@ -431,129 +412,692 @@ def calculate_heading(lat1, lon1, lat2, lon2):
     return np.degrees(heading) % 360
 
 
-def calculate_moving_heading(df, window=HEADING_WINDOW):
-    """Calculate moving average heading vector."""
-    coords = df[["lat_deg", "lon_deg"]].copy()
+# ============================================================================
+# MÉTHODE 1 : Point le plus éloigné (distance euclidienne)
+# ============================================================================
 
-    headings = []
-    for i in range(len(coords)):
-        if i == 0:
-            headings.append(np.nan)
-            continue
-
-        # Look back up to 'window' points for stable heading
-        start_idx = max(0, i - window)
-        lat1, lon1 = coords.iloc[start_idx][["lat_deg", "lon_deg"]]
-        lat2, lon2 = coords.iloc[i][["lat_deg", "lon_deg"]]
-
-        if pd.notna([lat1, lon1, lat2, lon2]).all():
-            heading = calculate_heading(lat1, lon1, lat2, lon2)
-            headings.append(heading)
-        else:
-            headings.append(np.nan)
-
-    return pd.Series(headings, index=df.index)
-
-
-def detect_turnaround(df, edge_pct=EDGE_PERCENT):
+def method_furthest_point(df, edge_pct=EDGE_PERCENT):
     """
-    Detect turnaround by finding where the path overlaps with itself.
-    Verifies: path overlap, heading reversal, and return to start.
+    Détecte le demi-tour comme le point le plus éloigné du point de départ
+    (distance euclidienne / vol d'oiseau).
     """
-    if df[["lat_deg", "lon_deg"]].isna().all().all():
-        print("Warning: No GPS data available for turnaround detection")
-        return None
+    print("\n[MÉTHODE 1] Point le plus éloigné (euclidienne)")
 
     coords = df[["lat_deg", "lon_deg"]].dropna()
     if len(coords) < 50:
-        print("Warning: Insufficient GPS points for turnaround detection")
+        print("✗ Pas assez de points GPS")
         return None
 
-    # 1. Find farthest point from start (candidate turnaround)
-    start_point = coords.iloc[0].values
-    distances_from_start = np.sqrt(
-        (coords["lat_deg"] - start_point[0]) ** 2 +
-        (coords["lon_deg"] - start_point[1]) ** 2
-    )
-
-    candidate_idx = distances_from_start.idxmax()
-
-    # 2. Check if it's near edges
-    total_points = len(coords)
-    edge_n = max(1, int(total_points * edge_pct))
     coord_indices = coords.index.tolist()
-    candidate_position = coord_indices.index(candidate_idx)
+    total_points = len(coord_indices)
+    edge_n = max(10, int(total_points * edge_pct))
 
-    if candidate_position < edge_n or candidate_position > total_points - edge_n:
-        print("Warning: Candidate turnaround at route edge")
-        return None
+    # Point de départ
+    start_point = coords.iloc[0].values
 
-    # 3. Verify path overlap
-    outbound = coords.iloc[:candidate_position].values
-    inbound = coords.iloc[candidate_position:].values
-
-    if len(inbound) < MIN_OVERLAP_POINTS:
-        print("Warning: Not enough points after candidate to verify overlap")
-        return None
-
-    # Calculate pairwise distances between outbound and inbound points
-    distances = cdist(inbound, outbound, metric='euclidean')
-    min_distances = distances.min(axis=1)
-
-    # Count overlapping points
-    overlap_points = (min_distances < OVERLAP_THRESHOLD).sum()
-    overlap_ratio = overlap_points / len(inbound)
-
-    print(f"Path overlap analysis:")
-    print(f"  - Candidate at index {candidate_idx} (position {candidate_position}/{total_points})")
-    print(f"  - Overlapping points: {overlap_points}/{len(inbound)} ({overlap_ratio * 100:.1f}%)")
-    print(f"  - Median return distance: {np.median(min_distances) * 111:.1f}m")
-
-    if overlap_points < MIN_OVERLAP_POINTS:
-        print("Warning: Insufficient path overlap - may not be out-and-back route")
-        return None
-
-    # 4. Verify heading reversal
-    df_temp = df.copy()
-    df_temp["heading"] = calculate_moving_heading(df, window=HEADING_WINDOW)
-
-    if candidate_idx in df_temp.index:
-        pre_idx = coord_indices[max(0, candidate_position - HEADING_WINDOW)]
-        post_idx = coord_indices[min(len(coord_indices) - 1, candidate_position + HEADING_WINDOW)]
-
-        heading_before = df_temp.loc[pre_idx, "heading"]
-        heading_after = df_temp.loc[post_idx, "heading"]
-
-        if pd.notna([heading_before, heading_after]).all():
-            heading_change = abs(heading_after - heading_before)
-            if heading_change > 180:
-                heading_change = 360 - heading_change
-
-            print(f"  - Heading change: {heading_change:.1f}° (expect ~180° for turnaround)")
-
-            if heading_change < 120:
-                print("Warning: Heading change suggests this may not be a turnaround")
-
-    # 5. Check return to start
-    end_point = coords.iloc[-1].values
-    end_to_start = np.sqrt(
-        (end_point[0] - start_point[0]) ** 2 +
-        (end_point[1] - start_point[1]) ** 2
+    # Calculer la distance euclidienne de chaque point au départ
+    distances_to_start = np.sqrt(
+        (coords.values[:, 0] - start_point[0]) ** 2 +
+        (coords.values[:, 1] - start_point[1]) ** 2
     )
-    max_dist = distances_from_start.max()
 
-    print(f"  - Distance from end to start: {end_to_start * 111:.1f}m")
-    print(f"  - Maximum distance from start: {max_dist * 111:.1f}m")
+    # Exclure les bords
+    distances_to_start[:edge_n] = -np.inf
+    distances_to_start[-edge_n:] = -np.inf
 
-    if end_to_start > max_dist * 0.3:
-        print("Warning: Route doesn't return close to start")
+    # Trouver le maximum
+    max_pos = np.argmax(distances_to_start)
+    turnaround_idx = coord_indices[max_pos]
+    max_dist_km = distances_to_start[max_pos] * 111
 
-    if overlap_ratio > 0.5:  # At least 50% overlap
-        print("✓ Out-and-back route detected")
-        return candidate_idx
-    else:
-        print("✗ Not an out-and-back route")
+    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
+    print(f"  Distance au départ : {max_dist_km:.2f} km")
+
+    return turnaround_idx
+
+
+# ============================================================================
+# MÉTHODE 2 : Distance GPS cumulée maximale
+# ============================================================================
+
+def method_cumulative_distance(df, edge_pct=EDGE_PERCENT):
+    """
+    Détecte le demi-tour comme le point où la distance GPS cumulée atteint
+    son maximum (ne fonctionne que si la distance décroît au retour).
+    """
+    print("\n[MÉTHODE 2] Distance GPS cumulée maximale")
+
+    if "distance" not in df.columns or df["distance"].isna().all():
+        print("✗ Pas de données de distance")
         return None
+
+    distances = df["distance"].dropna()
+    if len(distances) < 50:
+        print("✗ Pas assez de points avec distance")
+        return None
+
+    edge_n = max(10, int(len(distances) * edge_pct))
+
+    # Exclure les bords
+    distances_copy = distances.copy()
+    distances_copy.iloc[:edge_n] = -np.inf
+    distances_copy.iloc[-edge_n:] = -np.inf
+
+    turnaround_idx = distances_copy.idxmax()
+    max_dist_km = distances.loc[turnaround_idx] / 1000
+
+    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
+    print(f"  Distance cumulée : {max_dist_km:.2f} km")
+
+    return turnaround_idx
+
+
+# ============================================================================
+# MÉTHODE 3 : Extremum 3D (courbure spatio-temporelle)
+# ============================================================================
+
+def method_3d_curvature(df, edge_pct=EDGE_PERCENT):
+    """
+    Détecte le demi-tour comme le point de courbure maximale dans l'espace
+    3D (lat, lon, temps normalisé).
+    """
+    print("\n[MÉTHODE 3] Extremum 3D (courbure)")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    if len(coords) < 50:
+        print("✗ Pas assez de points GPS")
+        return None
+
+    coord_indices = coords.index.tolist()
+    total_points = len(coord_indices)
+    edge_n = max(10, int(total_points * edge_pct))
+
+    # Construire la trajectoire 3D : (x, y, t_normalized)
+    x = coords.values[:, 0]
+    y = coords.values[:, 1]
+    t = np.linspace(0, 1, total_points)  # Temps normalisé [0, 1]
+
+    # Lisser les coordonnées pour réduire le bruit
+    x_smooth = gaussian_filter1d(x, sigma=5)
+    y_smooth = gaussian_filter1d(y, sigma=5)
+
+    # Calculer les dérivées premières (vitesse)
+    dx = np.gradient(x_smooth)
+    dy = np.gradient(y_smooth)
+    dt = np.gradient(t)
+
+    # Calculer les dérivées secondes (accélération)
+    ddx = np.gradient(dx)
+    ddy = np.gradient(dy)
+
+    # Courbure 3D : magnitude de l'accélération dans le plan (x, y)
+    curvature = np.sqrt(ddx ** 2 + ddy ** 2)
+
+    # Exclure les bords
+    curvature[:edge_n] = -np.inf
+    curvature[-edge_n:] = -np.inf
+
+    # Trouver le maximum de courbure
+    max_curv_pos = np.argmax(curvature)
+    turnaround_idx = coord_indices[max_curv_pos]
+
+    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
+    print(f"  Courbure maximale : {curvature[max_curv_pos]:.6f}")
+
+    return turnaround_idx
+
+
+# ============================================================================
+# MÉTHODE 4 : Hybride (heading + distance)
+# ============================================================================
+
+def calculate_moving_heading(df, window=10):
+    """Calcule le heading avec une fenêtre mobile."""
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    headings = pd.Series(index=coords.index, dtype=float)
+
+    for i in range(len(coords)):
+        start = max(0, i - window)
+        end = min(len(coords), i + window + 1)
+
+        if end - start < 2:
+            continue
+
+        segment = coords.iloc[start:end]
+        dlat = segment.iloc[-1, 0] - segment.iloc[0, 0]
+        dlon = segment.iloc[-1, 1] - segment.iloc[0, 1]
+
+        heading = np.degrees(np.arctan2(dlon, dlat)) % 360
+        headings.iloc[i] = heading
+
+    return headings
+
+
+def method_hybrid_heading_distance(df, edge_pct=EDGE_PERCENT, heading_threshold=150):
+    """
+    Détecte le demi-tour en combinant :
+    1. Changements de heading significatifs (>150°)
+    2. Distance maximale au point de départ parmi les candidats
+    3. Vérification du chevauchement de parcours
+    """
+    print("\n[MÉTHODE 4] Hybride (heading + distance)")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    if len(coords) < 50:
+        print("✗ Pas assez de points GPS")
+        return None
+
+    coord_indices = coords.index.tolist()
+    total_points = len(coord_indices)
+    edge_n = max(10, int(total_points * edge_pct))
+
+    # 1. Calculer les headings
+    headings = calculate_moving_heading(df, window=HEADING_WINDOW)
+
+    # 2. Détecter les changements de heading
+    candidates = []
+
+    for i in range(edge_n, total_points - edge_n):
+        idx = coord_indices[i]
+
+        if idx not in headings.index:
+            continue
+
+        # Heading avant et après
+        pre_idx = coord_indices[max(0, i - HEADING_WINDOW)]
+        post_idx = coord_indices[min(total_points - 1, i + HEADING_WINDOW)]
+
+        if pre_idx not in headings.index or post_idx not in headings.index:
+            continue
+
+        heading_before = headings.loc[pre_idx]
+        heading_after = headings.loc[post_idx]
+
+        if pd.isna([heading_before, heading_after]).any():
+            continue
+
+        heading_change = abs(heading_after - heading_before)
+        if heading_change > 180:
+            heading_change = 360 - heading_change
+
+        if heading_change >= heading_threshold:
+            candidates.append({
+                'idx': idx,
+                'position': i,
+                'heading_change': heading_change
+            })
+
+    if len(candidates) == 0:
+        print("✗ Aucun changement de heading significatif détecté")
+        return None
+
+    print(f"  {len(candidates)} candidats avec heading change >{heading_threshold}°")
+
+    # 3. Parmi les candidats, choisir celui le plus éloigné du départ
+    start_point = coords.iloc[0].values
+
+    best_candidate = None
+    max_distance = -1
+
+    for cand in candidates:
+        pos = cand['position']
+        point = coords.iloc[pos].values
+        dist = np.sqrt((point[0] - start_point[0]) ** 2 + (point[1] - start_point[1]) ** 2)
+
+        if dist > max_distance:
+            max_distance = dist
+            best_candidate = cand
+
+    turnaround_idx = best_candidate['idx']
+
+    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
+    print(f"  Heading change : {best_candidate['heading_change']:.1f}°")
+    print(f"  Distance au départ : {max_distance * 111:.2f} km")
+
+    return turnaround_idx
+
+
+# ============================================================================
+# MÉTHODE 5 : Variance de distance aux autres points
+# ============================================================================
+
+def method_distance_variance(df, edge_pct=EDGE_PERCENT):
+    """
+    Détecte le demi-tour comme le point où la variance des distances
+    aux autres points change drastiquement.
+    """
+    print("\n[MÉTHODE 5] Variance de distance")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    if len(coords) < 50:
+        print("✗ Pas assez de points GPS")
+        return None
+
+    coord_indices = coords.index.tolist()
+    total_points = len(coord_indices)
+    edge_n = max(10, int(total_points * edge_pct))
+
+    # Calculer la matrice de distances
+    distances_matrix = cdist(coords.values, coords.values, metric='euclidean')
+
+    # Pour chaque point, calculer la variance des distances aux autres points
+    variances = np.var(distances_matrix, axis=1)
+
+    # Exclure les bords
+    variances[:edge_n] = -np.inf
+    variances[-edge_n:] = -np.inf
+
+    # Le demi-tour est le point de variance maximale
+    max_var_pos = np.argmax(variances)
+    turnaround_idx = coord_indices[max_var_pos]
+
+    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
+    print(f"  Variance maximale : {variances[max_var_pos]:.6f}")
+
+    return turnaround_idx
+
+
+# ============================================================================
+# MÉTHODE 6 : Inversion de direction temporelle
+# ============================================================================
+
+def method_temporal_inversion(df, edge_pct=EDGE_PERCENT):
+    """
+    Détecte le demi-tour en identifiant le changement de direction temporelle
+    des correspondances spatiales (méthode précédente).
+    """
+    print("\n[MÉTHODE 6] Inversion de direction temporelle")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    if len(coords) < 50:
+        print("✗ Pas assez de points GPS")
+        return None
+
+    coord_indices = coords.index.tolist()
+    total_points = len(coord_indices)
+    edge_n = max(10, int(total_points * edge_pct))
+
+    coords_array = coords.values
+    distances_matrix = cdist(coords_array, coords_array, metric='euclidean')
+
+    temporal_directions = []
+
+    for i in range(edge_n, total_points - edge_n):
+        window = 20
+        mask = np.ones(total_points, dtype=bool)
+        mask[max(0, i - window):min(total_points, i + window + 1)] = False
+
+        valid_distances = distances_matrix[i].copy()
+        valid_distances[~mask] = np.inf
+
+        if np.all(np.isinf(valid_distances)):
+            continue
+
+        nearest_idx = np.argmin(valid_distances)
+        nearest_distance = valid_distances[nearest_idx]
+
+        if nearest_distance < OVERLAP_THRESHOLD:
+            temporal_direction = nearest_idx - i
+            temporal_directions.append((i, temporal_direction))
+
+    if len(temporal_directions) == 0:
+        print("✗ Aucune correspondance spatiale trouvée")
+        return None
+
+    # Détecter le changement de direction
+    turnaround_candidates = []
+
+    for idx, (i, direction) in enumerate(temporal_directions[:-1]):
+        next_direction = temporal_directions[idx + 1][1]
+
+        if direction > 0 and next_direction < 0:
+            turnaround_candidates.append({
+                'index': i,
+                'score': abs(direction) + abs(next_direction)
+            })
+
+    if len(turnaround_candidates) == 0:
+        print("✗ Aucun changement de direction temporelle détecté")
+        return None
+
+    best_candidate = max(turnaround_candidates, key=lambda x: x['score'])
+    turnaround_idx = coord_indices[best_candidate['index']]
+
+    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
+
+    return turnaround_idx
+
+def refine_turn_by_local_curvature(df, start, end):
+    coords = df[["lat_deg", "lon_deg"]].iloc[start:end].values
+    if len(coords) < 5:
+        return None
+
+    x = gaussian_filter1d(coords[:, 0], sigma=3)
+    y = gaussian_filter1d(coords[:, 1], sigma=3)
+
+    dx = np.gradient(x)
+    dy = np.gradient(y)
+    ddx = np.gradient(dx)
+    ddy = np.gradient(dy)
+
+    curvature = np.sqrt(ddx**2 + ddy**2)
+
+    local_idx = np.argmax(curvature)
+    return df.index[start + local_idx]
+
+
+def get_candidate_window(i0, n, window_size=40):
+    start = max(0, i0 - window_size)
+    end = min(n, i0 + window_size + 1)
+    return start, end
+
+
+def refine_turn_by_spatial_curvature(df, start, end):
+    coords = df[["lat_deg", "lon_deg"]].iloc[start:end].values
+    if len(coords) < 5:
+        return None
+
+    # recentrage
+    coords -= coords.mean(axis=0)
+
+    x = gaussian_filter1d(coords[:, 0], sigma=3)
+    y = gaussian_filter1d(coords[:, 1], sigma=3)
+
+    # paramétrisation spatiale
+    ds = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    s = np.concatenate([[0], np.cumsum(ds)])
+    if s[-1] == 0:
+        return None
+    s /= s[-1]
+
+    dx = np.gradient(x, s)
+    dy = np.gradient(y, s)
+    ddx = np.gradient(dx, s)
+    ddy = np.gradient(dy, s)
+
+    curvature = np.abs(dx * ddy - dy * ddx) / (dx**2 + dy**2 + 1e-12)**1.5
+
+    local_idx = np.argmax(curvature)
+    return df.index[start + local_idx]
+
+
+def refine_turn_by_spatial_curvature_real(df, start, end):
+    """
+    Affine le point de demi-tour dans une fenêtre locale en utilisant
+    la vraie courbure plane κ(s), paramétrée par la longueur d'arc.
+    """
+    coords = df[["lat_deg", "lon_deg"]].iloc[start:end].values
+    n = len(coords)
+    if n < 7:
+        return None
+
+    # Recentrage (invariance translation)
+    coords = coords - coords.mean(axis=0)
+
+    # Lissage léger (anti-bruit GPS)
+    x = gaussian_filter1d(coords[:, 0], sigma=2)
+    y = gaussian_filter1d(coords[:, 1], sigma=2)
+
+    # Paramétrisation par longueur d’arc s
+    dx_raw = np.diff(x)
+    dy_raw = np.diff(y)
+    ds = np.sqrt(dx_raw**2 + dy_raw**2)
+
+    if np.all(ds == 0):
+        return None
+
+    s = np.concatenate([[0], np.cumsum(ds)])
+    s /= s[-1]  # normalisation [0,1]
+
+    # Dérivées par rapport à s
+    dx = np.gradient(x, s)
+    dy = np.gradient(y, s)
+    ddx = np.gradient(dx, s)
+    ddy = np.gradient(dy, s)
+
+    # Courbure réelle κ(s)
+    curvature = np.abs(dx * ddy - dy * ddx) / (dx**2 + dy**2 + 1e-12)**1.5
+
+    # Sécurité : ignorer les bords de la fenêtre
+    curvature[0] = curvature[-1] = -np.inf
+
+    local_pos = np.argmax(curvature)
+    return df.index[start + local_pos]
+
+
+def method_dynamic_centroid_refined(df, edge_pct=EDGE_PERCENT, window_size=40):
+    print("\n[MÉTHODE] Dynamic centroid + affinement local")
+
+    i0 = method_dynamic_centroid(df, edge_pct)
+    if i0 is None:
+        return None
+
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    idx_list = coords.index.tolist()
+    pos = idx_list.index(i0)
+
+    start, end = get_candidate_window(pos, len(idx_list), window_size)
+
+    # refined_idx = refine_turn_by_local_curvature(df, start, end)
+    # refined_idx = refine_turn_by_spatial_curvature(df, start, end)
+    refined_idx = refine_turn_by_spatial_curvature_real(df, start, end)
+
+    if refined_idx is not None:
+        print(f"✓ Affiné : {refined_idx}")
+        return refined_idx
+
+    print("⚠ Affinage échoué, retour du point centroid")
+    return i0
+
+
+
+def method_dynamic_centroid(df, edge_pct=EDGE_PERCENT):
+    print("\n[MÉTHODE F] Centroïde dynamique")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna().values
+    n = len(coords)
+    edge_n = max(10, int(n * edge_pct))
+
+    scores = np.zeros(n)
+
+    for i in range(edge_n, n - edge_n):
+        c = coords[:i].mean(axis=0)
+        scores[i] = np.linalg.norm(coords[i] - c)
+
+    idx = np.argmax(scores)
+    print(f"✓ Demi-tour à {df.index[idx]}")
+    return df.index[idx]
+
+def method_pca_extremum(df, edge_pct=EDGE_PERCENT):
+    print("\n[MÉTHODE E] Extremum PCA")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna().values
+    coords -= coords.mean(axis=0)
+
+    u, s, vh = np.linalg.svd(coords, full_matrices=False)
+    proj = u[:, 0] * s[0]
+
+    n = len(proj)
+    edge_n = max(10, int(n * edge_pct))
+    proj[:edge_n] = -np.inf
+    proj[-edge_n:] = -np.inf
+
+    idx = np.argmax(np.abs(proj))
+    print(f"✓ Demi-tour à {df.index[idx]}")
+    return df.index[idx]
+
+def method_path_symmetry(df, edge_pct=EDGE_PERCENT):
+    print("\n[MÉTHODE D] Symétrie de trajectoire")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna().values
+    n = len(coords)
+    edge_n = max(10, int(n * edge_pct))
+
+    scores = np.full(n, np.inf)
+
+    for i in range(edge_n, n - edge_n):
+        a = coords[:i]
+        b = coords[i:][::-1]
+        m = min(len(a), len(b))
+        scores[i] = np.mean(np.linalg.norm(a[-m:] - b[:m], axis=1))
+
+    idx = np.argmin(scores)
+    print(f"✓ Demi-tour à {df.index[idx]}")
+    return df.index[idx]
+
+
+def method_nearest_neighbor_inversion(df, edge_pct=EDGE_PERCENT):
+    print("\n[MÉTHODE C] Inversion du voisin temporel")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna().values
+    n = len(coords)
+    edge_n = max(10, int(n * edge_pct))
+
+    mat = cdist(coords, coords)
+    np.fill_diagonal(mat, np.inf)
+
+    signs = []
+
+    for i in range(edge_n, n - edge_n):
+        j = np.argmin(mat[i])
+        signs.append((i, np.sign(j - i)))
+
+    for k in range(len(signs) - 1):
+        if signs[k][1] > 0 and signs[k + 1][1] < 0:
+            idx = signs[k][0]
+            print(f"✓ Demi-tour à {df.index[idx]}")
+            return df.index[idx]
+
+    return None
+
+
+def method_self_overlap(df, edge_pct=EDGE_PERCENT):
+    print("\n[MÉTHODE B] Auto-recouvrement spatial")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna().values
+    n = len(coords)
+    edge_n = max(10, int(n * edge_pct))
+
+    overlap_score = np.zeros(n)
+
+    for i in range(edge_n, n - edge_n):
+        past = coords[:i]
+        future = coords[i:]
+        d = cdist(past, future)
+        overlap_score[i] = np.mean(d.min(axis=1))
+
+    overlap_score[:edge_n] = np.inf
+    overlap_score[-edge_n:] = np.inf
+
+    idx = np.argmin(overlap_score)
+    print(f"✓ Demi-tour à {df.index[idx]}")
+    return df.index[idx]
+
+
+def method_distance_to_past_path(df, edge_pct=EDGE_PERCENT):
+    print("\n[MÉTHODE A] Distance au chemin passé")
+
+    coords = df[["lat_deg", "lon_deg"]].dropna().values
+    n = len(coords)
+    if n < 50:
+        return None
+
+    edge_n = max(10, int(n * edge_pct))
+    scores = np.zeros(n)
+
+    for i in range(edge_n, n - edge_n):
+        past = coords[:i]
+        dists = cdist([coords[i]], past)
+        scores[i] = np.min(dists)
+
+    scores[:edge_n] = -np.inf
+    scores[-edge_n:] = -np.inf
+
+    idx = np.argmax(scores)
+    print(f"✓ Demi-tour à {df.index[idx]}")
+    return df.index[idx]
+
+
+def detect_turnaround(df, method="dynamic_centroid_refined", edge_pct=EDGE_PERCENT):
+    """
+    Détecte le point de demi-tour sur un trajet aller-retour.
+
+    Paramètres :
+    -----------
+    df : DataFrame
+        DataFrame contenant les données GPS (colonnes lat_deg, lon_deg)
+    method : str
+        Méthode de détection à utiliser :
+        - "furthest_point" : Point le plus éloigné du départ (euclidienne)
+        - "cumulative_distance" : Distance GPS cumulée maximale
+        - "3d_curvature" : Extremum 3D (courbure spatio-temporelle)
+        - "hybrid" : Hybride (heading + distance)
+        - "variance" : Variance de distance aux autres points
+        - "temporal_inversion" : Inversion de direction temporelle
+    edge_pct : float
+        Pourcentage des extrémités à exclure (défaut: 0.05 = 5%)
+
+    Retourne :
+    ---------
+    int ou None : Index du point de demi-tour, ou None si non détecté
+    """
+
+    methods_map = {
+        "furthest_point": method_furthest_point,
+        "cumulative_distance": method_cumulative_distance,
+        "3d_curvature": method_3d_curvature,
+        "hybrid": method_hybrid_heading_distance,
+        "variance": method_distance_variance,
+        "temporal_inversion": method_temporal_inversion,
+        "distance_to_path": method_distance_to_past_path,
+        "self_overlap": method_self_overlap,
+        "nn_inversion": method_nearest_neighbor_inversion,
+        "symmetry": method_path_symmetry,
+        "pca": method_pca_extremum,
+        "dynamic_centroid": method_dynamic_centroid,
+        "dynamic_centroid_refined": method_dynamic_centroid_refined
+    }
+
+    if method not in methods_map:
+        available = ", ".join(methods_map.keys())
+        raise ValueError(f"Méthode '{method}' inconnue. Disponibles : {available}")
+
+    print(f"\n{'=' * 60}")
+    print(f"DÉTECTION DE DEMI-TOUR")
+    print(f"{'=' * 60}")
+
+    # Appeler la méthode choisie
+    turnaround_idx = methods_map[method](df, edge_pct)
+
+    # Afficher des informations complémentaires si détecté
+    if turnaround_idx is not None:
+        coords = df[["lat_deg", "lon_deg"]].dropna()
+        coord_indices = coords.index.tolist()
+
+        if turnaround_idx in coord_indices:
+            position = coord_indices.index(turnaround_idx)
+            total = len(coord_indices)
+
+            print(f"\n{'=' * 60}")
+            print(f"Position dans le parcours : {position}/{total} ({position / total * 100:.1f}%)")
+
+            # Distance au départ et à l'arrivée
+            start_point = coords.iloc[0].values
+            end_point = coords.iloc[-1].values
+            turn_point = coords.loc[turnaround_idx].values
+
+            dist_to_start = np.linalg.norm(turn_point - start_point) * 111
+            dist_to_end = np.linalg.norm(turn_point - end_point) * 111
+
+            print(f"Distance au départ : {dist_to_start:.2f} km")
+            print(f"Distance à l'arrivée : {dist_to_end:.2f} km")
+
+            # Distance départ-arrivée
+            start_to_end = np.linalg.norm(end_point - start_point) * 111
+            print(f"Distance départ → arrivée : {start_to_end:.2f} km")
+            print(f"{'=' * 60}\n")
+
+    return turnaround_idx
 
 
 def detect_extrema(series, order=EXTREMA_ORDER):
@@ -565,73 +1109,80 @@ def detect_extrema(series, order=EXTREMA_ORDER):
 
 
 def plot_gps_map(df, zones, turnaround_idx=None, save_path=None):
-    """Plot GPS map with slope coloring and optional turnaround detection."""
+    """Plot GPS map with corrected layout."""
     gps_ok = df[["lon_deg", "lat_deg"]].dropna()
 
     if len(gps_ok) == 0:
         print("Warning: No GPS data available, skipping GPS map")
         return
 
-    # Determine number of subplots
     if turnaround_idx is not None:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig = plt.figure(figsize=(16, 6))
+        # Manually position subplots to leave room for colorbar
+        ax1 = fig.add_subplot(121)
+        ax2 = fig.add_subplot(122)
+        axes = [ax1, ax2]
+
         df_outbound = df.loc[:turnaround_idx].copy()
         df_return = df.loc[turnaround_idx:].copy()
         turnaround_lat = df.loc[turnaround_idx, "lat_deg"]
         turnaround_lon = df.loc[turnaround_idx, "lon_deg"]
     else:
         fig, axes = plt.subplots(1, 1, figsize=(10, 8))
-        axes = [axes]  # Make it iterable
+        axes = [axes]
 
-    # Map bounds
     lon_min, lon_max = gps_ok["lon_deg"].min(), gps_ok["lon_deg"].max()
     lat_min, lat_max = gps_ok["lat_deg"].min(), gps_ok["lat_deg"].max()
-    pad_lon = (lon_max - lon_min) * 0.02
-    pad_lat = (lat_max - lat_min) * 0.02
-
-    # Color by HR zone
-    df["zone_color"] = df["heart_rate"].apply(lambda hr: get_zone_color(hr, zones))
+    pad_lon = (lon_max - lon_min) * 0.05
+    pad_lat = (lat_max - lat_min) * 0.05
 
     if turnaround_idx is not None:
-        # Outbound
         sc1 = axes[0].scatter(
             df_outbound["lon_deg"], df_outbound["lat_deg"],
             c=df_outbound["slope"], cmap="coolwarm",
-            s=10, alpha=0.8, vmin=-15, vmax=15
+            s=12, alpha=0.8, vmin=-15, vmax=15
         )
         axes[0].scatter(turnaround_lon, turnaround_lat,
-                        color="black", marker="X", s=100, label="Turnaround", zorder=5)
-        axes[0].set_title("Outbound")
+                        color="black", marker="X", s=150, label="Turnaround",
+                        zorder=5, edgecolors='white', linewidths=1.5)
+        axes[0].set_title("Outbound", fontsize=12, pad=10)
         axes[0].set_aspect("equal", adjustable="box")
         axes[0].set_xlim(lon_min - pad_lon, lon_max + pad_lon)
         axes[0].set_ylim(lat_min - pad_lat, lat_max + pad_lat)
-        axes[0].legend()
+        axes[0].legend(loc='best')
         axes[0].set_xlabel("Longitude")
         axes[0].set_ylabel("Latitude")
+        axes[0].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
 
-        # Return
         sc2 = axes[1].scatter(
             df_return["lon_deg"], df_return["lat_deg"],
             c=df_return["slope"], cmap="coolwarm",
-            s=10, alpha=0.8, vmin=-15, vmax=15
+            s=12, alpha=0.8, vmin=-15, vmax=15
         )
         axes[1].scatter(turnaround_lon, turnaround_lat,
-                        color="black", marker="X", s=100, label="Turnaround", zorder=5)
-        axes[1].set_title("Return")
+                        color="black", marker="X", s=150, label="Turnaround",
+                        zorder=5, edgecolors='white', linewidths=1.5)
+        axes[1].set_title("Return", fontsize=12, pad=10)
         axes[1].set_aspect("equal", adjustable="box")
         axes[1].set_xlim(lon_min - pad_lon, lon_max + pad_lon)
         axes[1].set_ylim(lat_min - pad_lat, lat_max + pad_lat)
-        axes[1].legend()
+        axes[1].legend(loc='best')
         axes[1].set_xlabel("Longitude")
+        axes[1].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
 
-        fig.suptitle("GPS Route - Outbound vs Return (color = slope %)", fontsize=14)
-        fig.colorbar(sc1, ax=axes, fraction=0.03, pad=0.02, label="Slope (%)")
+        fig.suptitle("GPS Route - Outbound vs Return (color = slope %)", fontsize=14, y=0.98)
+
+        # Adjust subplot positions to make room for colorbar
+        fig.subplots_adjust(left=0.05, right=0.88, top=0.92, bottom=0.08, wspace=0.15)
+
+        # Add colorbar in remaining space
+        cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
+        fig.colorbar(sc1, cax=cbar_ax, label="Slope (%)")
     else:
-        # Single route
         sc = axes[0].scatter(
             df["lon_deg"], df["lat_deg"],
             c=df["slope"], cmap="coolwarm",
-            s=10, alpha=0.8, vmin=-15, vmax=15
+            s=12, alpha=0.8, vmin=-15, vmax=15
         )
         axes[0].set_title("GPS Route (color = slope %)")
         axes[0].set_aspect("equal", adjustable="box")
@@ -639,29 +1190,37 @@ def plot_gps_map(df, zones, turnaround_idx=None, save_path=None):
         axes[0].set_ylim(lat_min - pad_lat, lat_max + pad_lat)
         axes[0].set_xlabel("Longitude")
         axes[0].set_ylabel("Latitude")
-        fig.colorbar(sc, ax=axes[0], fraction=0.03, pad=0.02, label="Slope (%)")
+        axes[0].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        fig.colorbar(sc, ax=axes[0], fraction=0.03, pad=0.04, label="Slope (%)")
+        plt.tight_layout()
 
-    plt.tight_layout()
     if save_path:
-        plt.savefig(Path(save_path) / "gps_map.png", dpi=150)
+        plt.savefig(Path(save_path) / "gps_map.png", dpi=150, bbox_inches='tight')
     plt.show()
+
+    # 6. Dans main(), REMPLACER LA DERNIÈRE LIGNE du summary par:
+    # Au lieu de: print(f"Total Effort: {df['effort'].iloc[-1]:.1f}")
+    # Utiliser:
+    if not df["effort"].isna().all():
+        print(f"Avg Effort: {df['effort'].mean():.1f}")
+        print(f"Max Effort: {df['effort'].max():.1f}")
 
 
 def plot_metrics_stack(df, zones, extrema_order=EXTREMA_ORDER, save_path=None):
-    """Plot stacked metrics with local extrema detection."""
+    """Plot stacked metrics with local extrema detection (but not on effort)."""
     fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
 
     # Assign zone colors
     df["zone_color"] = df["heart_rate"].apply(lambda hr: get_zone_color(hr, zones))
 
     series_info = [
-        ("speed_kmh", "Speed (km/h)", "tab:blue"),
-        ("slope", "Slope (%)", "tab:green"),
-        ("heart_rate", "Heart Rate (bpm)", None),  # Will use zone colors
-        ("effort", "Effort", "tab:purple"),
+        ("speed_kmh", "Speed (km/h)", "tab:blue", True),
+        ("slope", "Slope (%)", "tab:green", True),
+        ("heart_rate", "Heart Rate (bpm)", None, True),  # Will use zone colors
+        ("effort", "Effort", "tab:purple", False),  # No extrema for effort
     ]
 
-    for ax, (col, label, color) in zip(axes, series_info):
+    for ax, (col, label, color, detect_extrema_flag) in zip(axes, series_info):
         y = df[col].dropna().values
         x = df[col].dropna().index.map(lambda i: df.loc[i, "time_s"]).values
 
@@ -676,25 +1235,26 @@ def plot_metrics_stack(df, zones, extrema_order=EXTREMA_ORDER, save_path=None):
             ax.plot(x, y, color=color, label=label, linewidth=1.5)
             ax.set_ylabel(label, color=color)
 
-        # Detect extrema
-        minima, maxima = detect_extrema(df[col].dropna(), order=extrema_order)
+        # Detect extrema only if flag is True
+        if detect_extrema_flag:
+            minima, maxima = detect_extrema(df[col].dropna(), order=extrema_order)
 
-        # Plot extrema
-        for idx in minima:
-            actual_idx = df[col].dropna().index[idx]
-            ax.plot(df.loc[actual_idx, "time_s"], df.loc[actual_idx, col],
-                    "v", color=color if color else "red", markersize=8)
-            for ax_all in axes:
-                ax_all.axvline(df.loc[actual_idx, "time_s"],
-                               color=color if color else "red", alpha=0.15, linestyle="--")
+            # Plot extrema
+            for idx in minima:
+                actual_idx = df[col].dropna().index[idx]
+                ax.plot(df.loc[actual_idx, "time_s"], df.loc[actual_idx, col],
+                        "v", color=color if color else "red", markersize=8)
+                for ax_all in axes:
+                    ax_all.axvline(df.loc[actual_idx, "time_s"],
+                                   color=color if color else "red", alpha=0.15, linestyle="--")
 
-        for idx in maxima:
-            actual_idx = df[col].dropna().index[idx]
-            ax.plot(df.loc[actual_idx, "time_s"], df.loc[actual_idx, col],
-                    "^", color=color if color else "red", markersize=8)
-            for ax_all in axes:
-                ax_all.axvline(df.loc[actual_idx, "time_s"],
-                               color=color if color else "red", alpha=0.15, linestyle="--")
+            for idx in maxima:
+                actual_idx = df[col].dropna().index[idx]
+                ax.plot(df.loc[actual_idx, "time_s"], df.loc[actual_idx, col],
+                        "^", color=color if color else "red", markersize=8)
+                for ax_all in axes:
+                    ax_all.axvline(df.loc[actual_idx, "time_s"],
+                                   color=color if color else "red", alpha=0.15, linestyle="--")
 
         ax.grid(alpha=0.3)
 
@@ -840,7 +1400,7 @@ def main():
     elif args.effort_method == 'hrtss':
         effort = calculate_effort_hrtss(df, zone_boundaries)
     else:  # custom
-        effort = calculate_effort_custom(df, zone_boundaries, resting_hr=user_resting_hr)
+        effort = calculate_effort_custom(df, zone_boundaries)
 
     df["effort"] = effort
 
@@ -895,7 +1455,8 @@ def main():
         print(f"Avg HR: {df['heart_rate'].mean():.0f} bpm")
         print(f"Max HR: {df['heart_rate'].max():.0f} bpm")
     if not df["effort"].isna().all():
-        print(f"Total Effort: {df['effort'].iloc[-1]:.1f}")
+        print(f"Avg Effort: {df['effort'].mean():.1f}")
+        print(f"Max Effort: {df['effort'].max():.1f}")
 
 
 if __name__ == "__main__":
