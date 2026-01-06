@@ -11,15 +11,14 @@ Usage:
 """
 
 # Done: Make sure the turning point is correctly detected
-# ToDo? Improve the custom formula for effort
-# ToDo: Test it with multiple .FIT files
+# Done Improve the custom formula for effort
+# Done: Test it with multiple .FIT files
 
 import fitdecode
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from mpl_toolkits.mplot3d import Axes3D  # ToDo: Use or remove
 from scipy.signal import argrelextrema
 from scipy.spatial.distance import cdist
 from scipy.ndimage import gaussian_filter1d
@@ -30,14 +29,38 @@ from pathlib import Path
 # -------------------------
 # Constants
 # -------------------------
-SLOPE_WINDOW = 5  # Rolling window for slope smoothing
-SLOPE_BOUNDS_DEFAULT = (-10, 20)  # Default slope clipping bounds (%)
+SLOPE_WINDOW = 10  # Rolling window for slope smoothing
+SLOPE_BOUND_DEFAULT = 25  # Default slope clipping bounds (%)
 EXTREMA_ORDER = 30  # Window for local min/max detection
 EDGE_PERCENT = 0.05  # Edge percentage for turnaround detection
 SEMICIRCLES_TO_DEGREES = 180.0 / 2 ** 31  # FIT file coordinate conversion
 OVERLAP_THRESHOLD = 0.0001  # ~11 meters in degrees
 MIN_OVERLAP_POINTS = 20
 HEADING_WINDOW = 10
+
+# === Effort Normalization Constants ===
+
+# Slope bounds (%)
+SLOPE_BOUND_MAX = SLOPE_BOUND_DEFAULT   # par défaut 50%
+SLOPE_BOUND_MIN = -SLOPE_BOUND_MAX      # symétrique négatif
+
+# Speed bounds (km/h)
+SPEED_BOUND_MIN = 0.0
+SPEED_BOUND_MAX = 60.0     # considérée comme vitesse extrême possible
+
+# Heart rate normalization bounds
+# On va utiliser Z1–Z4 en interne si zones disponibles,
+# sinon min/max observés dans la sortie
+HR_NORM_MIN = None
+HR_NORM_MAX = None
+
+# Pondération des facteurs (total = 1)
+WEIGHT_SLOPE = 0.5
+WEIGHT_SPEED = 0.3
+WEIGHT_HR    = 0.1
+
+# Effort global
+BASE_MULTIPLIER = 50.0
 
 # hrTSS multipliers per zone (TSS per hour)
 HRTSS_ZONE_MULTIPLIERS = {
@@ -133,9 +156,9 @@ Examples:
 
     # Analysis parameters
     parser.add_argument(
-        '--slope-bounds',
+        '--slope-bound',
         type=str,
-        help='Slope clipping bounds: MIN,MAX (default: -10,20)'
+        help='Slope clipping bounds: default: 50'
     )
     parser.add_argument(
         '--extrema-window',
@@ -191,20 +214,6 @@ def parse_karvonen(karvonen_str):
         return resting_hr, max_hr
     except ValueError as e:
         print(f"Error: Invalid Karvonen format: {e}")
-        sys.exit(1)
-
-
-def parse_slope_bounds(bounds_str):
-    """Parse slope bounds from comma-separated string."""
-    try:
-        parts = [float(x.strip()) for x in bounds_str.split(',')]
-        if len(parts) != 2:
-            raise ValueError(f"Expected 2 values (min,max), got {len(parts)}")
-        if parts[0] >= parts[1]:
-            raise ValueError("Min bound must be less than max bound")
-        return tuple(parts)
-    except ValueError as e:
-        print(f"Error: Invalid slope bounds: {e}")
         sys.exit(1)
 
 
@@ -300,13 +309,13 @@ def load_fit_file(file_path):
     return pd.DataFrame(records)
 
 
-def prepare_data(df, has_gps=True, slope_bounds=SLOPE_BOUNDS_DEFAULT):
-    """Prepare and process cycling data."""
-    # Time
+def prepare_data(df, has_gps=True, slope_bound=SLOPE_BOUND_DEFAULT):
+    """Prepare and process cycling data with robust slope cleaning and smoothing."""
+    # --- Time ---
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["time_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
 
-    # GPS coordinates
+    # --- GPS coordinates ---
     if has_gps and "position_lat" in df.columns and "position_long" in df.columns:
         df["lat_deg"] = pd.to_numeric(df.get("position_lat"), errors="coerce") * SEMICIRCLES_TO_DEGREES
         df["lon_deg"] = pd.to_numeric(df.get("position_long"), errors="coerce") * SEMICIRCLES_TO_DEGREES
@@ -314,77 +323,110 @@ def prepare_data(df, has_gps=True, slope_bounds=SLOPE_BOUNDS_DEFAULT):
         df["lat_deg"] = np.nan
         df["lon_deg"] = np.nan
 
-    # Speed / Distance / Altitude
+    # --- Speed / Distance / Altitude ---
     df["enhanced_speed"] = pd.to_numeric(df.get("enhanced_speed"), errors="coerce")
-    df["speed"] = df.get("speed", df["enhanced_speed"])
-    df["speed"] = pd.to_numeric(df["speed"], errors="coerce")
+    df["speed"] = pd.to_numeric(df.get("speed", df["enhanced_speed"]), errors="coerce")
     df["speed_kmh"] = df["speed"] * 3.6
     df["distance"] = pd.to_numeric(df.get("distance"), errors="coerce")
     df["enhanced_altitude"] = pd.to_numeric(df.get("enhanced_altitude"), errors="coerce")
-    df["altitude"] = df.get("altitude", df["enhanced_altitude"])
-    df["altitude"] = pd.to_numeric(df["altitude"], errors="coerce")
+    df["altitude"] = pd.to_numeric(df.get("altitude", df["enhanced_altitude"]), errors="coerce")
 
-    # Heart rate
+    # --- Heart rate & Power ---
     df["heart_rate"] = pd.to_numeric(df.get("heart_rate"), errors="coerce")
-
-    # Power (if available)
     df["power"] = pd.to_numeric(df.get("power"), errors="coerce")
 
-    # Calculate slope
+    # --- Calculate raw slope ---
     df["delta_alt"] = df["altitude"].diff()
     df["delta_dist"] = df["distance"].diff()
+    df.loc[df["delta_dist"] < 5, "delta_dist"] = np.nan  # ignore trop court
     with np.errstate(divide="ignore", invalid="ignore"):
         df["slope"] = (df["delta_alt"] / df["delta_dist"]) * 100.0
     df.loc[(df["delta_dist"] <= 0) | ~np.isfinite(df["slope"]), "slope"] = np.nan
-    df["slope"] = df["slope"].rolling(window=SLOPE_WINDOW, center=True, min_periods=1).mean()
-    df["slope_clipped"] = df["slope"].clip(slope_bounds[0], slope_bounds[1])
+
+    # --- Clean extreme slopes ---
+    # On supprime les pentes totalement impossibles (physiologiquement ou topographiquement)
+    df["slope_clean"] = df["slope"].where(
+        df["slope"].between(-slope_bound, slope_bound)
+    )
+
+    # --- Smooth slope ---
+    # Fenêtre de 20 m en avant/arrière
+    slope_smoothed = []
+    distances = df["distance"].to_numpy()
+    slopes = df["slope_clean"].to_numpy()
+    window = 20  # m
+
+    for i, d in enumerate(distances):
+        mask = (distances >= d - window) & (distances <= d + window)
+        valid = slopes[mask]
+        valid = valid[np.isfinite(valid)]
+        if len(valid) > 0:
+            slope_smoothed.append(valid.mean())
+        else:
+            slope_smoothed.append(np.nan)
+
+    df["slope_smoothed"] = slope_smoothed
+
+    # --- Final clip ---
+    # Sécurité pour éviter que le lissage ne crée des valeurs absurdes
+    df["slope_final"] = df["slope_smoothed"].clip(-slope_bound, slope_bound)
 
     return df
 
 
-def calculate_effort_custom(df, zone_boundaries, smooth=True):
-    """Zone-aware custom effort calculation (instantaneous, smoothed)."""
-    df["hr_zone"] = df["heart_rate"].apply(
-        lambda hr: get_hr_zone_number(hr, zone_boundaries)
-    )
+def calculate_effort_hrtss(df, zone_boundaries, zone_values=None,
+                           smooth=True, alpha_hr=1.0, default_effort=20):
+    """
+    Calculate instantaneous hrTSS rate with continuous HR zones.
 
-    zone_intensity = df["hr_zone"].map(ZONE_INTENSITY)
-    slope_modifier = 1 + (df["slope_clipped"] / 10) * 0.4
-    slope_modifier = slope_modifier.clip(0.5, 2.0)
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain 'heart_rate' column.
+    zone_boundaries : list
+        HR thresholds defining zones (ascending).
+    zone_values : list or None
+        Effort values for each zone. If None, use HRTSS_ZONE_MULTIPLIERS defaults.
+    smooth : bool
+        Apply 15s rolling mean if True.
+    alpha_hr : float
+        Weight of HR in effort (0 = ignore HR, 1 = full HR influence)
+    default_effort : float
+        Fallback if HR outside defined zones.
 
-    speed_baseline = 25.0
-    speed_ratio = (df["speed_kmh"] / speed_baseline).clip(0.1, 3.0)
-    speed_modifier = 0.8 + 0.2 * (speed_ratio ** 1.5)
+    Returns
+    -------
+    pd.Series
+        Instantaneous hrTSS effort.
+    """
+    if zone_values is None:
+        zone_values = [HRTSS_ZONE_MULTIPLIERS.get(z, default_effort)
+                       for z in range(len(zone_boundaries))]
 
-    effort = zone_intensity * slope_modifier * speed_modifier * 50
+    def hr_zone_continuous(hr):
+        for i, bound in enumerate(zone_boundaries):
+            if hr <= bound:
+                prev_val = zone_values[i - 1] if i > 0 else zone_values[0]
+                next_val = zone_values[i]
+                prev_bound = zone_boundaries[i - 1] if i > 0 else 0
+                return prev_val + (hr - prev_bound) / (bound - prev_bound) * (next_val - prev_val)
+        return zone_values[-1]
 
-    # Smooth with rolling mean (15 second window)
+    hr_effort = df["heart_rate"].apply(hr_zone_continuous)
+    hr_effort = hr_effort * alpha_hr + (1 - alpha_hr) * default_effort
+
     if smooth:
-        effort = effort.rolling(window=15, center=True, min_periods=1).mean()
+        hr_effort = hr_effort.rolling(window=15, center=True, min_periods=1).mean()
 
-    return effort
-
-
-def calculate_effort_hrtss(df, zone_boundaries, smooth=True):
-    """Calculate hrTSS rate (instantaneous, not cumulative, smoothed)."""
-    df["hr_zone"] = df["heart_rate"].apply(
-        lambda hr: get_hr_zone_number(hr, zone_boundaries)
-    )
-
-    # TSS rate per hour (instantaneous)
-    effort = df["hr_zone"].map(
-        lambda z: HRTSS_ZONE_MULTIPLIERS.get(z, 20)
-    )
-
-    # Smooth with rolling mean (15 second window)
-    if smooth:
-        effort = effort.rolling(window=15, center=True, min_periods=1).mean()
-
-    return effort
+    return hr_effort
 
 
 def calculate_effort_tss(df, ftp=None):
-    """Calculate TSS rate from power (instantaneous, not cumulative)."""
+    """
+    Calculate instantaneous TSS rate from power (Coggan-style).
+
+    Returns unitless effort comparable to TSS/h.
+    """
     if "power" not in df.columns or df["power"].isna().all():
         print("Warning: No power data available, falling back to hrTSS")
         return None
@@ -393,14 +435,75 @@ def calculate_effort_tss(df, ftp=None):
         ftp = df["power"].dropna().quantile(0.75)
         print(f"Info: Estimated FTP = {ftp:.0f}W")
 
-    rolling_power = df["power"].rolling(window=30, min_periods=1).mean()
-    np_power = (rolling_power ** 4).rolling(window=30, min_periods=1).mean() ** 0.25
+    # Normalized Power (NP) standard: rolling 30s on raw power
+    np_power = (df["power"].rolling(window=30, min_periods=1).mean() ** 4).rolling(window=30,
+                                                                                   min_periods=1).mean() ** 0.25
     intensity_factor = np_power / ftp
 
-    # TSS rate (instantaneous)
-    tss_rate = (np_power * intensity_factor) / (ftp * 36)
+    # Instantaneous TSS rate (~percent per hour)
+    tss_rate = np_power * intensity_factor / (ftp * 36)
 
     return tss_rate
+
+
+def calculate_effort_custom(df,
+                            base_multiplier=BASE_MULTIPLIER,
+                            slope_weight=WEIGHT_SLOPE,
+                            speed_weight=WEIGHT_SPEED,
+                            hr_weight=WEIGHT_HR,
+                            slope_bound=SLOPE_BOUND_MAX,
+                            speed_max=SPEED_BOUND_MAX,
+                            hr_min=HR_NORM_MIN,
+                            hr_max=HR_NORM_MAX,
+                            smooth=True):
+    """
+    Effort custom normalisé sur slope, speed et heart_rate,
+    basé sur des bornes réalistes et des poids relatifs.
+    """
+
+    # --- Normalisation pente ---
+    slope = df["slope_final"].copy().fillna(0.0)
+    # Limite extrêmes physiologiques
+    slope = slope.clip(SLOPE_BOUND_MIN, slope_bound)
+    # Normalise : pente négative = 0, pente max = 1
+    slope_norm = (slope - SLOPE_BOUND_MIN) / (slope_bound - SLOPE_BOUND_MIN)
+
+    # --- Normalisation vitesse ---
+    speed = df["speed_kmh"].copy().fillna(0.0)
+    speed = speed.clip(SPEED_BOUND_MIN, speed_max)
+    speed_norm = (speed - SPEED_BOUND_MIN) / (speed_max - SPEED_BOUND_MIN)
+
+    # --- Normalisation heart rate ---
+    hr = df["heart_rate"].copy().interpolate(method="linear").fillna(method="bfill").fillna(method="ffill")
+
+    # Determiner bornes si pas passées
+    if hr_min is None or hr_max is None:
+        hr_min_local = hr.min() if hr_min is None else hr_min
+        hr_max_local = hr.max() if hr_max is None else hr_max
+    else:
+        hr_min_local = hr_min
+        hr_max_local = hr_max
+
+    hr = hr.clip(hr_min_local, hr_max_local)
+    # Normalise HR entre hr_min_local et hr_max_local
+    denom_hr = (hr_max_local - hr_min_local) if (hr_max_local - hr_min_local) != 0 else 1
+    hr_norm = (hr - hr_min_local) / denom_hr
+
+    # --- Combinaison pondérée ---
+    combined = (slope_norm * slope_weight +
+                speed_norm * speed_weight +
+                hr_norm    * hr_weight)
+
+    # --- Effort final ---
+    effort = base_multiplier * combined
+
+    # --- Lissage exponentiel ---
+    if smooth:
+        effort = effort.ewm(span=15, adjust=False).mean()
+
+    return effort
+
+
 
 
 def calculate_heading(lat1, lon1, lat2, lon2):
@@ -1215,9 +1318,10 @@ def plot_metrics_stack(df, zones, extrema_order=EXTREMA_ORDER, save_path=None):
 
     series_info = [
         ("speed_kmh", "Speed (km/h)", "tab:blue", True),
-        ("slope", "Slope (%)", "tab:green", True),
-        ("heart_rate", "Heart Rate (bpm)", None, True),  # Will use zone colors
         ("effort", "Effort", "tab:purple", False),  # No extrema for effort
+        ("slope_final", "Slope (%)", "tab:green", True),
+        ("heart_rate", "Heart Rate (bpm)", None, True),  # Will use zone colors
+
     ]
 
     for ax, (col, label, color, detect_extrema_flag) in zip(axes, series_info):
@@ -1350,9 +1454,13 @@ def main():
     args = parse_arguments()
 
     # Parse slope bounds
-    slope_bounds = SLOPE_BOUNDS_DEFAULT
-    if args.slope_bounds:
-        slope_bounds = parse_slope_bounds(args.slope_bounds)
+    slope_bound = SLOPE_BOUND_DEFAULT
+
+    if args.slope_bound:
+        try:
+            slope_bound = int(args.slope_bound)
+        except:
+            pass
 
     # Determine zone calculation method
     zone_boundaries = None
@@ -1383,7 +1491,7 @@ def main():
     df = load_fit_file(args.file)
 
     has_gps = not args.no_gps
-    df = prepare_data(df, has_gps=has_gps, slope_bounds=slope_bounds)
+    df = prepare_data(df, has_gps=has_gps, slope_bound=slope_bound)
 
     # Check for heart rate data
     if df["heart_rate"].isna().all():
@@ -1400,7 +1508,7 @@ def main():
     elif args.effort_method == 'hrtss':
         effort = calculate_effort_hrtss(df, zone_boundaries)
     else:  # custom
-        effort = calculate_effort_custom(df, zone_boundaries)
+        effort = calculate_effort_custom(df)
 
     df["effort"] = effort
 
