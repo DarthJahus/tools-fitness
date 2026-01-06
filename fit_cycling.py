@@ -22,6 +22,7 @@ import seaborn as sns
 from scipy.signal import argrelextrema
 from scipy.spatial.distance import cdist
 from scipy.ndimage import gaussian_filter1d
+from scipy.interpolate import CubicSpline
 import argparse
 import sys
 from pathlib import Path
@@ -453,19 +454,17 @@ def calculate_effort_custom(df,
                             hr_weight=WEIGHT_HR,
                             slope_bound=SLOPE_BOUND_MAX,
                             speed_max=SPEED_BOUND_MAX,
-                            hr_min=HR_NORM_MIN,
-                            hr_max=HR_NORM_MAX,
+                            user_hr_zones=None,  # liste des zones HR de l'utilisateur
                             smooth=True):
     """
     Effort custom normalisé sur slope, speed et heart_rate,
     basé sur des bornes réalistes et des poids relatifs.
+    Si user_hr_zones est fourni, le HR est normalisé via ces zones avec spline.
     """
 
     # --- Normalisation pente ---
     slope = df["slope_final"].copy().fillna(0.0)
-    # Limite extrêmes physiologiques
     slope = slope.clip(SLOPE_BOUND_MIN, slope_bound)
-    # Normalise : pente négative = 0, pente max = 1
     slope_norm = (slope - SLOPE_BOUND_MIN) / (slope_bound - SLOPE_BOUND_MIN)
 
     # --- Normalisation vitesse ---
@@ -476,18 +475,23 @@ def calculate_effort_custom(df,
     # --- Normalisation heart rate ---
     hr = df["heart_rate"].copy().interpolate(method="linear").fillna(method="bfill").fillna(method="ffill")
 
-    # Determiner bornes si pas passées
-    if hr_min is None or hr_max is None:
-        hr_min_local = hr.min() if hr_min is None else hr_min
-        hr_max_local = hr.max() if hr_max is None else hr_max
-    else:
-        hr_min_local = hr_min
-        hr_max_local = hr_max
+    if user_hr_zones is not None and len(user_hr_zones) > 0:
+        # --- Création des points pour interpolation spline ---
+        hr_points = [0] + user_hr_zones
+        intensity_points = [ZONE_INTENSITY.get(i, 1.0) for i in range(len(user_hr_zones))]
+        intensity_points.append(intensity_points[-1])  # extrapolation pour HR > max zone
 
-    hr = hr.clip(hr_min_local, hr_max_local)
-    # Normalise HR entre hr_min_local et hr_max_local
-    denom_hr = (hr_max_local - hr_min_local) if (hr_max_local - hr_min_local) != 0 else 1
-    hr_norm = (hr - hr_min_local) / denom_hr
+        # spline cubique pour une courbe lisse
+        spline = CubicSpline(hr_points, intensity_points, extrapolate=True)
+
+        # application spline sur la série HR
+        hr_norm = hr.apply(lambda x: float(spline(x)))
+    else:
+        # fallback : normalisation classique min/max
+        hr_min_local = hr.min()
+        hr_max_local = hr.max()
+        denom_hr = (hr_max_local - hr_min_local) if (hr_max_local - hr_min_local) != 0 else 1
+        hr_norm = (hr - hr_min_local) / denom_hr
 
     # --- Combinaison pondérée ---
     combined = (slope_norm * slope_weight +
@@ -497,13 +501,11 @@ def calculate_effort_custom(df,
     # --- Effort final ---
     effort = base_multiplier * combined
 
-    # --- Lissage exponentiel ---
+    # --- Lissage exponentiel (optionnel) ---
     if smooth:
         effort = effort.ewm(span=15, adjust=False).mean()
 
     return effort
-
-
 
 
 def calculate_heading(lat1, lon1, lat2, lon2):
