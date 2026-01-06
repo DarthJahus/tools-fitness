@@ -134,4 +134,4 @@ Measure first thing in the morning, while still in bed:
 - Check if your measurement is correct
 
 ## Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions welcome! Please submit pull requests or open issues.
