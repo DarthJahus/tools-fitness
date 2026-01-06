@@ -1,18 +1,7 @@
 """
 FIT Cycling Analyzer
 Analyzes cycling data from FIT files: GPS tracking, effort calculation, and performance metrics.
-
-Usage:
-    python fit_cycling.py <file.fit>
-    python fit_cycling.py <file.fit> --zones 112,124,136,149,161
-    python fit_cycling.py <file.fit> --max-hr 185 --circuit
-    python fit_cycling.py <file.fit> --karvonen 60,185 --plots gps,metrics
-    python fit_cycling.py <file.fit> --effort-method hrtss
 """
-
-# Done: Make sure the turning point is correctly detected
-# Done Improve the custom formula for effort
-# Done: Test it with multiple .FIT files
 
 import fitdecode
 import pandas as pd
@@ -31,37 +20,18 @@ from pathlib import Path
 # Constants
 # -------------------------
 SLOPE_WINDOW = 10  # Rolling window for slope smoothing
-SLOPE_BOUND_DEFAULT = 25  # Default slope clipping bounds (%)
+SLOPE_BOUND_DEFAULT = 25  # Default slope clipping bound (±, %)
 EXTREMA_ORDER = 30  # Window for local min/max detection
 EDGE_PERCENT = 0.05  # Edge percentage for turnaround detection
 SEMICIRCLES_TO_DEGREES = 180.0 / 2 ** 31  # FIT file coordinate conversion
 OVERLAP_THRESHOLD = 0.0001  # ~11 meters in degrees
 MIN_OVERLAP_POINTS = 20
 HEADING_WINDOW = 10
-
-# === Effort Normalization Constants ===
-
-# Slope bounds (%)
-SLOPE_BOUND_MAX = SLOPE_BOUND_DEFAULT   # par défaut 50%
-SLOPE_BOUND_MIN = -SLOPE_BOUND_MAX      # symétrique négatif
-
-# Speed bounds (km/h)
 SPEED_BOUND_MIN = 0.0
 SPEED_BOUND_MAX = 60.0     # considérée comme vitesse extrême possible
-
-# Heart rate normalization bounds
-# On va utiliser Z1–Z4 en interne si zones disponibles,
-# sinon min/max observés dans la sortie
-HR_NORM_MIN = None
-HR_NORM_MAX = None
-
-# Pondération des facteurs (total = 1)
-WEIGHT_SLOPE = 0.5
-WEIGHT_SPEED = 0.3
-WEIGHT_HR    = 0.1
-
-# Effort global
-BASE_MULTIPLIER = 50.0
+WEIGHT_SLOPE = 0.5  # Pondération des facteurs
+WEIGHT_SPEED = 0.35
+WEIGHT_HR    = 0.15
 
 # hrTSS multipliers per zone (TSS per hour)
 HRTSS_ZONE_MULTIPLIERS = {
@@ -248,8 +218,9 @@ def calculate_zones_hrr(max_hr, resting_hr):
 
 def create_zone_dict(zone_boundaries):
     """Create zone dictionary from boundaries."""
-    colors = ["lightgrey", "lightblue", "green", "orange", "red", "purple"]
-    zones = {}
+    colors = ["#cccccc", "#a6a6a6", "#3b82f6", "#10b981", "#f59e0b", "#dc2626"]
+
+    zones = dict()
 
     # Zone 0
     zones[f"Zone 0 (0-{zone_boundaries[0]})"] = (0, zone_boundaries[0], colors[0])
@@ -448,11 +419,10 @@ def calculate_effort_tss(df, ftp=None):
 
 
 def calculate_effort_custom(df,
-                            base_multiplier=BASE_MULTIPLIER,
                             slope_weight=WEIGHT_SLOPE,
                             speed_weight=WEIGHT_SPEED,
                             hr_weight=WEIGHT_HR,
-                            slope_bound=SLOPE_BOUND_MAX,
+                            slope_bound=SLOPE_BOUND_DEFAULT,
                             speed_max=SPEED_BOUND_MAX,
                             user_hr_zones=None,  # liste des zones HR de l'utilisateur
                             smooth=True):
@@ -460,20 +430,21 @@ def calculate_effort_custom(df,
     Effort custom normalisé sur slope, speed et heart_rate,
     basé sur des bornes réalistes et des poids relatifs.
     Si user_hr_zones est fourni, le HR est normalisé via ces zones avec spline.
+    L'effort final est rescalé entre 10% et 90%.
     """
 
     # --- Normalisation pente ---
-    slope = df["slope_final"].copy().fillna(0.0)
-    slope = slope.clip(SLOPE_BOUND_MIN, slope_bound)
-    slope_norm = (slope - SLOPE_BOUND_MIN) / (slope_bound - SLOPE_BOUND_MIN)
+    slope = df["slope_final"].copy().interpolate(method="spline", order=3).bfill().ffill()
+    slope = slope.clip(-slope_bound, slope_bound)
+    slope_norm = (slope + slope_bound) / (2 * slope_bound)
 
     # --- Normalisation vitesse ---
-    speed = df["speed_kmh"].copy().fillna(0.0)
+    speed = df["speed_kmh"].copy().interpolate(method="spline", order=3).bfill().ffill()
     speed = speed.clip(SPEED_BOUND_MIN, speed_max)
     speed_norm = (speed - SPEED_BOUND_MIN) / (speed_max - SPEED_BOUND_MIN)
 
     # --- Normalisation heart rate ---
-    hr = df["heart_rate"].copy().interpolate(method="linear").fillna(method="bfill").fillna(method="ffill")
+    hr = df["heart_rate"].copy().interpolate(method="spline", order=3).bfill().ffill()
 
     if user_hr_zones is not None and len(user_hr_zones) > 0:
         # --- Création des points pour interpolation spline ---
@@ -490,7 +461,7 @@ def calculate_effort_custom(df,
         # fallback : normalisation classique min/max
         hr_min_local = hr.min()
         hr_max_local = hr.max()
-        denom_hr = (hr_max_local - hr_min_local) if (hr_max_local - hr_min_local) != 0 else 1
+        denom_hr = hr_max_local - hr_min_local if hr_max_local != hr_min_local else 1.0
         hr_norm = (hr - hr_min_local) / denom_hr
 
     # --- Combinaison pondérée ---
@@ -498,14 +469,17 @@ def calculate_effort_custom(df,
                 speed_norm * speed_weight +
                 hr_norm    * hr_weight)
 
-    # --- Effort final ---
-    effort = base_multiplier * combined
-
     # --- Lissage exponentiel (optionnel) ---
     if smooth:
-        effort = effort.ewm(span=15, adjust=False).mean()
+        combined = combined.ewm(span=15, adjust=False).mean()
 
-    return effort
+    # --- Rescaling entre 10% et 90% ---
+    combined_min = combined.min()
+    combined_max = combined.max()
+    denom_combined = combined_max - combined_min if combined_max != combined_min else 1.0
+    effort_scaled = 10 + 80 * (combined - combined_min) / denom_combined
+
+    return effort_scaled
 
 
 def calculate_heading(lat1, lon1, lat2, lon2):
@@ -1308,7 +1282,7 @@ def plot_gps_map(df, zones, turnaround_idx=None, save_path=None):
     # Utiliser:
     if not df["effort"].isna().all():
         print(f"Avg Effort: {df['effort'].mean():.1f}")
-        print(f"Max Effort: {df['effort'].max():.1f}")
+        # print(f"Max Effort: {df['effort'].max():.1f}")  # affichera toujours 90
 
 
 def plot_metrics_stack(df, zones, extrema_order=EXTREMA_ORDER, save_path=None):
