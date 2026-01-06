@@ -155,7 +155,8 @@ Examples:
     parser.add_argument(
         '--turnaround-method',
         type=str,
-        choices=gps_helper.get_turnaround_method()
+        choices=[method for method in gps_helper.get_turnaround_method()] + [method + "_refined" for method in gps_helper.get_turnaround_method()],
+        help='Add _refined to improve precision'
     )
 
     return parser.parse_args()
@@ -511,7 +512,7 @@ def calculate_effort_custom(df,
     return effort_scaled
 
 
-def detect_turnaround(df, edge_pct=gps_helper.EDGE_PERCENT, method=gps_helper.DEFAULT_METHOD):
+def detect_turnaround(df, edge_pct=gps_helper.EDGE_PERCENT, method=gps_helper.DEFAULT_METHOD, refine=False):
     """
     Détecte le point de demi-tour sur un trajet aller-retour.
 
@@ -525,7 +526,7 @@ def detect_turnaround(df, edge_pct=gps_helper.EDGE_PERCENT, method=gps_helper.DE
     print(f"{'=' * 60}")
 
     # Appeler la méthode choisie
-    turnaround_idx = gps_helper.detect_turnaround_method(df, edge_pct=edge_pct, method=method)
+    turnaround_idx = gps_helper.detect_turnaround_method(df, edge_pct=edge_pct, method=method, refine=refine)
 
     # Afficher des informations complémentaires si détecté
     if turnaround_idx is not None:
@@ -857,8 +858,8 @@ def main():
 
     turnaround_method = gps_helper.DEFAULT_METHOD
     if args.turnaround_method:
-        if args.turnaround_method in gps_helper.get_turnaround_method():
-            turnaround_method = args.turnaround_method
+        if args.turnaround_method[:-8 if args.turnaround_method[-8:].lower() == "_refined" else None] in gps_helper.get_turnaround_method():
+            turnaround_method = args.turnaround_method[:-8 if args.turnaround_method[-8:].lower() == "_refined" else None]
 
     if args.effort_method == 'tss':
         effort = calculate_effort_tss(df)
@@ -870,13 +871,13 @@ def main():
     else:  # custom
         effort = calculate_effort_custom(df)
 
-    df["effort"] = effort
+    df["effort"] = effort  # Que se passe-t-il si effort est None?
 
     # Turnaround detection
     turnaround_idx = None
     if args.circuit and has_gps:
         print("Detecting turnaround point...")
-        turnaround_idx = detect_turnaround(df, edge_pct=args.edge_percent, method=turnaround_method)
+        turnaround_idx = detect_turnaround(df, edge_pct=args.edge_percent, method=turnaround_method, refine=args.turnaround_method[-8:].lower() == "_refined")
         if turnaround_idx:
             print(f"Turnaround detected at index {turnaround_idx} "
                   f"(time: {df.loc[turnaround_idx, 'time_s']:.0f}s)")
