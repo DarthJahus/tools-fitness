@@ -3,9 +3,71 @@ import numpy as np
 from scipy.spatial.distance import cdist
 from scipy.ndimage import gaussian_filter1d
 
-EDGE_PERCENT = 0.05
+# -------------------------------------------------------------------
+# Turnaround detection – global parameters
+# -------------------------------------------------------------------
+
+# Percentage of the trajectory trimmed at start and end during
+# standard turnaround detection.
+# Used to ignore GPS noise, initial positioning errors, and final
+# approach artefacts.
+# historical default was 0.05. 0.25 is good
+EDGE_PERCENT = 0.25
+
+# Percentage of the trajectory trimmed during the optional second pass.
+# Much more aggressive, intended to suppress strong edge-related
+# false positives when the first detection is incoherent.
+# historical default was 0.25
+EDGE_PERCENT_2PASS = 0.5
+
+# Default turnaround detection method.
+# This value includes the refinement stage in the method name.
+# historical default was "dynamic_centroid_refined"
 DEFAULT_METHOD = "dynamic_centroid_refined"
+
+# Window size (number of samples) used for heading smoothing
+# or local heading computation in heading-based methods.
+# historical default was 10
 HEADING_WINDOW = 10
+
+# -------------------------------------------------------------------
+# Turnaround error model – constants
+# -------------------------------------------------------------------
+
+# Fraction of the trajectory (in [0,1]) considered structurally unsafe
+# for a real turnaround (too close to start or end of the activity).
+# historical default was 0.10
+TURNAROUND_EDGE_BUFFER_PCT = 0.10
+
+# Gain applied to the edge penalty.
+# Controls how fast the error increases when the detected point
+# moves closer to the start or end of the trajectory.
+# historical default was 2.0
+TURNAROUND_EDGE_PENALTY_GAIN = 2.0
+
+# Distance threshold (km) below which the turnaround point is considered
+# "local" to both start and end.
+# This typically indicates a spurious detection near the activity origin
+# (GPS jitter, small loops, or micro-turns).
+# historical default was 1.0
+TURNAROUND_LOCAL_DISTANCE_KM = 1.0
+
+# Fixed penalty added when the turnaround point is simultaneously close
+# to both the start and the end of the trajectory.
+# historical default was 1.0
+TURNAROUND_LOCAL_PENALTY = 1.0
+
+# Penalty applied when the overall trajectory is incompatible with a
+# true out-and-back pattern.
+# Triggered when start and end are spatially far apart.
+# historical default was 1.0
+TURNAROUND_FAR_END_PENALTY = 0.5
+
+# Maximum acceptable spatial distance (km) between start and end points
+# for a trajectory to be considered a valid out-and-back.
+# Beyond this distance, the notion of a single turnaround becomes suspect.
+# historical default was 2
+TURNAROUND_MAX_START_END_DISTANCE_KM = 0.5
 
 
 def apply_refinement(detection_func):
@@ -253,7 +315,7 @@ def method_temporal_inversion(df, edge_pct=EDGE_PERCENT):
     for idx, (i, direction) in enumerate(temporal_directions[:-1]):
         next_direction = temporal_directions[idx + 1][1]
 
-        if direction > 0 and next_direction < 0:
+        if direction > 0 > next_direction:
             turnaround_candidates.append({
                 'index': i,
                 'score': abs(direction) + abs(next_direction)
@@ -437,29 +499,47 @@ def method_distance_to_past_path(df, edge_pct=EDGE_PERCENT):
 def turnaround_error_score(position_pct,
                            dist_to_start,
                            dist_to_end,
-                           start_to_end_dist):
+                           start_to_end_dist,
+                           normalize=True):
     """
     Score d'incohérence du demi-tour.
-    Plus il est élevé, moins la détection est crédible.
+    Normalisé sur [0, 1].
     """
+    TURNAROUND_MAX_EDGE_POSITION_PENALTY = (
+            TURNAROUND_EDGE_BUFFER_PCT * TURNAROUND_EDGE_PENALTY_GAIN
+    )
+    TURNAROUND_MAX_ERROR_SCORE = (
+            TURNAROUND_MAX_EDGE_POSITION_PENALTY +
+            TURNAROUND_LOCAL_PENALTY +
+            TURNAROUND_FAR_END_PENALTY
+    )
 
     score = 0.0
 
-    # Trop proche du début ou de la fin
-    if position_pct < 0.10:
-        score += (0.10 - position_pct) * 2.0
-    if position_pct > 0.90:
-        score += (position_pct - 0.90) * 2.0
+    # Demi-tour trop proche des bords
+    if position_pct < TURNAROUND_EDGE_BUFFER_PCT:
+        score += (
+            TURNAROUND_EDGE_BUFFER_PCT - position_pct
+        ) * TURNAROUND_EDGE_PENALTY_GAIN
 
-    # Trop proche du départ ET de l'arrivée
-    if dist_to_start < 1.0 and dist_to_end < 1.0:
-        score += 1.0
+    if position_pct > 1.0 - TURNAROUND_EDGE_BUFFER_PCT:
+        score += (
+            position_pct - (1.0 - TURNAROUND_EDGE_BUFFER_PCT)
+        ) * TURNAROUND_EDGE_PENALTY_GAIN
 
-    # Départ et arrivée quasi confondus
-    if start_to_end_dist < 0.3:
-        score += 1.0
+    # Point trop local (début et fin quasi confondus)
+    if (dist_to_start < TURNAROUND_LOCAL_DISTANCE_KM and
+        dist_to_end < TURNAROUND_LOCAL_DISTANCE_KM):
+        score += TURNAROUND_LOCAL_PENALTY
 
-    return score
+    # Parcours incompatible avec un aller-retour
+    if start_to_end_dist > TURNAROUND_MAX_START_END_DISTANCE_KM:
+        score += TURNAROUND_FAR_END_PENALTY
+
+    if not normalize:
+        return score
+
+    return min(score / TURNAROUND_MAX_ERROR_SCORE, 1.0)
 
 
 def get_turnaround_method(method=None):

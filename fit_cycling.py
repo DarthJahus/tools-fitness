@@ -28,7 +28,8 @@ SPEED_BOUND_MIN = 0.0
 SPEED_BOUND_MAX = 60.0     # considérée comme vitesse extrême possible
 WEIGHT_SLOPE = 0.5  # Pondération des facteurs
 WEIGHT_SPEED = 0.35
-WEIGHT_HR    = 0.15
+WEIGHT_HR = 0.15
+ERR_2PASS = 0.25
 
 # hrTSS multipliers per zone (TSS per hour)
 HRTSS_ZONE_MULTIPLIERS = {
@@ -156,7 +157,26 @@ Examples:
         '--turnaround-method',
         type=str,
         choices=[method for method in gps_helper.get_turnaround_method()] + [method + "_refined" for method in gps_helper.get_turnaround_method()],
-        help='Add _refined to improve precision'
+        help="Add _refined to improve precision"
+    )
+    parser.add_argument(
+        '--2pass',
+        action='store_true',
+        help="Enable second-pass turnaround detection if result is incoherent"
+    )
+
+    parser.add_argument(
+        '--2pass-error',
+        type=float,
+        default=ERR_2PASS,
+        help=f"Error threshold triggering second pass (default: {ERR_2PASS})"
+    )
+
+    parser.add_argument(
+        '--2pass-edge',
+        type=float,
+        default=gps_helper.EDGE_PERCENT_2PASS,
+        help=f"Edge percentage used for second pass (default: {gps_helper.EDGE_PERCENT_2PASS})"
     )
 
     return parser.parse_args()
@@ -511,52 +531,101 @@ def calculate_effort_custom(df,
 
     return effort_scaled
 
+def compute_turnaround_stats(df, turnaround_idx):
+    coords = df[["lat_deg", "lon_deg"]].dropna()
+    coord_indices = coords.index.tolist()
 
-def detect_turnaround(df, edge_pct=gps_helper.EDGE_PERCENT, method=gps_helper.DEFAULT_METHOD, refine=False):
-    """
-    Détecte le point de demi-tour sur un trajet aller-retour.
+    if turnaround_idx not in coord_indices:
+        return None
 
-    Retourne :
-    ---------
-    int ou None : Index du point de demi-tour, ou None si non détecté
-    """
+    position = coord_indices.index(turnaround_idx)
+    total = len(coord_indices)
+    position_pct = position / total
 
+    start_point = coords.iloc[0].values
+    end_point = coords.iloc[-1].values
+    turn_point = coords.loc[turnaround_idx].values
+
+    dist_to_start = np.linalg.norm(turn_point - start_point) * 111
+    dist_to_end = np.linalg.norm(turn_point - end_point) * 111
+    start_to_end = np.linalg.norm(end_point - start_point) * 111
+
+    error_score = gps_helper.turnaround_error_score(
+        position_pct=position_pct,
+        dist_to_start=dist_to_start,
+        dist_to_end=dist_to_end,
+        start_to_end_dist=start_to_end
+    )
+
+    return {
+        "position": position,
+        "total": total,
+        "position_pct": position_pct,
+        "dist_to_start": dist_to_start,
+        "dist_to_end": dist_to_end,
+        "start_to_end": start_to_end,
+        "error_score": error_score
+    }
+
+
+def detect_turnaround(
+    df,
+    edge_pct=gps_helper.EDGE_PERCENT,
+    method=gps_helper.DEFAULT_METHOD,
+    refine=False,
+    second_pass=False,
+    second_pass_edge_pct=gps_helper.EDGE_PERCENT_2PASS,
+    second_pass_err=ERR_2PASS
+):
     print(f"\n{'=' * 60}")
     print(f"DÉTECTION DE DEMI-TOUR")
     print(f"{'=' * 60}")
 
-    # Appeler la méthode choisie
-    turnaround_idx = gps_helper.detect_turnaround_method(df, edge_pct=edge_pct, method=method, refine=refine)
+    # ---------- 1re passe ----------
+    turnaround_idx = gps_helper.detect_turnaround_method(
+        df, edge_pct=edge_pct, method=method, refine=refine
+    )
 
-    # Afficher des informations complémentaires si détecté
+    final_idx = turnaround_idx
+    stats = None
+
     if turnaround_idx is not None:
-        coords = df[["lat_deg", "lon_deg"]].dropna()
-        coord_indices = coords.index.tolist()
+        stats = compute_turnaround_stats(df, turnaround_idx)
 
-        if turnaround_idx in coord_indices:
-            position = coord_indices.index(turnaround_idx)
-            total = len(coord_indices)
+        if stats and second_pass and stats["error_score"] > second_pass_err:
+            print("/!\\ Détection incohérente → 2e passe activée")
+            print(f"    edge_pct = {second_pass_edge_pct:.2f}")
 
-            print(f"\n{'=' * 60}")
-            print(f"Position dans le parcours : {position}/{total} ({position / total * 100:.1f}%)")
+            turnaround_idx_2 = gps_helper.detect_turnaround_method(
+                df,
+                edge_pct=second_pass_edge_pct,
+                method=method,
+                refine=refine
+            )
 
-            # Distance au départ et à l'arrivée
-            start_point = coords.iloc[0].values
-            end_point = coords.iloc[-1].values
-            turn_point = coords.loc[turnaround_idx].values
+            if turnaround_idx_2 is not None:
+                final_idx = turnaround_idx_2
+                stats = compute_turnaround_stats(df, final_idx)
+                print(f"✓ 2e passe retenue : demi-tour à {final_idx}")
+            else:
+                print("✗ 2e passe échouée, conservation du résultat initial")
 
-            dist_to_start = np.linalg.norm(turn_point - start_point) * 111
-            dist_to_end = np.linalg.norm(turn_point - end_point) * 111
+    # ---------- AFFICHAGE FINAL ----------
+    if final_idx is not None and stats is not None:
+        print(f"\n{'=' * 60}")
+        print(
+            f"Position dans le parcours : "
+            f"{stats['position']}/{stats['total']} "
+            f"({stats['position_pct'] * 100:.1f}%)"
+        )
+        print(f"Distance au départ : {stats['dist_to_start']:.2f} km" + (f" < {gps_helper.TURNAROUND_LOCAL_DISTANCE_KM:.2f} km" if stats['dist_to_start'] < gps_helper.TURNAROUND_LOCAL_DISTANCE_KM else f" > {gps_helper.TURNAROUND_LOCAL_DISTANCE_KM:.2f} km"))
+        print(f"Distance à l'arrivée : {stats['dist_to_end']:.2f} km" + (f" < {gps_helper.TURNAROUND_LOCAL_DISTANCE_KM:.2f} km" if stats['dist_to_end'] < gps_helper.TURNAROUND_LOCAL_DISTANCE_KM else f" > {gps_helper.TURNAROUND_LOCAL_DISTANCE_KM:.2f} km"))
+        print(f"Distance départ → arrivée : {stats['start_to_end']:.2f} km" + (f" < {gps_helper.TURNAROUND_MAX_START_END_DISTANCE_KM:.2f} km" if stats['start_to_end'] < gps_helper.TURNAROUND_MAX_START_END_DISTANCE_KM else f" > {gps_helper.TURNAROUND_MAX_START_END_DISTANCE_KM:.2f} km"))
+        print(f"Turnaround error score : {stats['error_score']:.2f}")
+        print(f"{'=' * 60}\n")
 
-            print(f"Distance au départ : {dist_to_start:.2f} km")
-            print(f"Distance à l'arrivée : {dist_to_end:.2f} km")
+    return final_idx
 
-            # Distance départ-arrivée
-            start_to_end = np.linalg.norm(end_point - start_point) * 111
-            print(f"Distance départ → arrivée : {start_to_end:.2f} km")
-            print(f"{'=' * 60}\n")
-
-    return turnaround_idx
 
 
 def detect_extrema(series, order=EXTREMA_ORDER):
@@ -877,10 +946,21 @@ def main():
     turnaround_idx = None
     if args.circuit and has_gps:
         print("Detecting turnaround point...")
-        turnaround_idx = detect_turnaround(df, edge_pct=args.edge_percent, method=turnaround_method, refine=args.turnaround_method[-8:].lower() == "_refined")
+        turnaround_idx = detect_turnaround(
+            df,
+            edge_pct=args.edge_percent,
+            method=turnaround_method,
+            refine=args.turnaround_method[-8:].lower() == "_refined",
+            second_pass=args.__dict__.get("2pass", False),
+            second_pass_edge_pct=args.__dict__.get("2pass_edge", gps_helper.EDGE_PERCENT_2PASS),
+            second_pass_err=args.__dict__.get("2pass_error", ERR_2PASS)
+        )
+
         if turnaround_idx:
-            print(f"Turnaround detected at index {turnaround_idx} "
-                  f"(time: {df.loc[turnaround_idx, 'time_s']:.0f}s)")
+            print(
+                f"Turnaround detected at index {turnaround_idx} "
+                f"(time: {df.loc[turnaround_idx, 'time_s']:.0f}s)"
+            )
 
     # Prepare save directory
     save_path = None
