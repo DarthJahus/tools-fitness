@@ -3,6 +3,8 @@ FIT Cycling Analyzer
 Analyzes cycling data from FIT files: GPS tracking, effort calculation, and performance metrics.
 """
 
+# ToDo: Rapport HTML avec les différents graphs
+
 import fitdecode
 import pandas as pd
 import numpy as np
@@ -326,10 +328,9 @@ def prepare_data(df, has_gps=True, slope_bound=SLOPE_BOUND_DEFAULT):
     slope_smoothed = []
     distances = df["distance"].to_numpy()
     slopes = df["slope_clean"].to_numpy()
-    window = 20  # m
 
     for i, d in enumerate(distances):
-        mask = (distances >= d - window) & (distances <= d + window)
+        mask = (distances >= d - SLOPE_WINDOW) & (distances <= d + SLOPE_WINDOW)
         valid = slopes[mask]
         valid = valid[np.isfinite(valid)]
         if len(valid) > 0:

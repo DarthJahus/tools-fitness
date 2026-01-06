@@ -1,10 +1,44 @@
 import pandas as pd
 import numpy as np
+from scipy.spatial.distance import cdist
+from scipy.ndimage import gaussian_filter1d
+
 EDGE_PERCENT = 0.05
 DEFAULT_METHOD = "dynamic_centroid_refined"
 HEADING_WINDOW = 10
-from scipy.spatial.distance import cdist
-from scipy.ndimage import gaussian_filter1d
+
+
+def apply_refinement(detection_func):
+    """Wrapper qui ajoute le raffinement par courbure à n'importe quelle méthode."""
+
+    def refined_method(df, edge_pct=EDGE_PERCENT, window_size=40):
+        func_name = detection_func.__name__.replace("method_", "")
+        print(f"[{func_name} + raffinement]")
+
+        i0 = detection_func(df, edge_pct)
+        if i0 is None:
+            return None
+
+        coords = df[["lat_deg", "lon_deg"]].dropna()
+        idx_list = coords.index.tolist()
+
+        try:
+            pos = idx_list.index(i0)
+        except ValueError:
+            print("⚠ Index non trouvé dans les coordonnées, retour brut")
+            return i0
+
+        start, end = get_candidate_window(pos, len(idx_list), window_size)
+        refined = refine_turn_by_spatial_curvature_real(df, start, end)
+
+        if refined is not None:
+            print(f"✓ Affiné : {i0} → {refined}")
+            return refined
+
+        print(f"⚠ Affinage échoué, retour du point brut : {i0}")
+        return i0
+
+    return refined_method
 
 
 def calculate_heading(lat1, lon1, lat2, lon2):
@@ -15,51 +49,13 @@ def calculate_heading(lat1, lon1, lat2, lon2):
     heading = np.arctan2(y, x)
     return np.degrees(heading) % 360
 
-def method_furthest_point(df, edge_pct=EDGE_PERCENT):
-    """
-    Détecte le demi-tour comme le point le plus éloigné du point de départ
-    (distance euclidienne / vol d'oiseau).
-    """
-    print("\n[MÉTHODE 1] Point le plus éloigné (euclidienne)")
-
-    coords = df[["lat_deg", "lon_deg"]].dropna()
-    if len(coords) < 50:
-        print("✗ Pas assez de points GPS")
-        return None
-
-    coord_indices = coords.index.tolist()
-    total_points = len(coord_indices)
-    edge_n = max(10, int(total_points * edge_pct))
-
-    # Point de départ
-    start_point = coords.iloc[0].values
-
-    # Calculer la distance euclidienne de chaque point au départ
-    distances_to_start = np.sqrt(
-        (coords.values[:, 0] - start_point[0]) ** 2 +
-        (coords.values[:, 1] - start_point[1]) ** 2
-    )
-
-    # Exclure les bords
-    distances_to_start[:edge_n] = -np.inf
-    distances_to_start[-edge_n:] = -np.inf
-
-    # Trouver le maximum
-    max_pos = np.argmax(distances_to_start)
-    turnaround_idx = coord_indices[max_pos]
-    max_dist_km = distances_to_start[max_pos] * 111
-
-    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
-    print(f"  Distance au départ : {max_dist_km:.2f} km")
-
-    return turnaround_idx
 
 def method_cumulative_distance(df, edge_pct=EDGE_PERCENT):
     """
     Détecte le demi-tour comme le point où la distance GPS cumulée atteint
     son maximum (ne fonctionne que si la distance décroît au retour).
     """
-    print("\n[MÉTHODE 2] Distance GPS cumulée maximale")
+    print("\n[MÉTHODE] Distance GPS cumulée maximale")
 
     if "distance" not in df.columns or df["distance"].isna().all():
         print("✗ Pas de données de distance")
@@ -85,12 +81,13 @@ def method_cumulative_distance(df, edge_pct=EDGE_PERCENT):
 
     return turnaround_idx
 
+
 def method_3d_curvature(df, edge_pct=EDGE_PERCENT):
     """
     Détecte le demi-tour comme le point de courbure maximale dans l'espace
     3D (lat, lon, temps normalisé).
     """
-    print("\n[MÉTHODE 3] Extremum 3D (courbure)")
+    print("\n[MÉTHODE] Extremum 3D (courbure)")
 
     coords = df[["lat_deg", "lon_deg"]].dropna()
     if len(coords) < 50:
@@ -135,6 +132,7 @@ def method_3d_curvature(df, edge_pct=EDGE_PERCENT):
 
     return turnaround_idx
 
+
 def calculate_moving_heading(df, window=10):
     """Calcule le heading avec une fenêtre mobile."""
     coords = df[["lat_deg", "lon_deg"]].dropna()
@@ -156,14 +154,14 @@ def calculate_moving_heading(df, window=10):
 
     return headings
 
+
 def method_hybrid_heading_distance(df, edge_pct=EDGE_PERCENT, heading_threshold=150):
     """
     Détecte le demi-tour en combinant :
     1. Changements de heading significatifs (>150°)
     2. Distance maximale au point de départ parmi les candidats
-    3. Vérification du chevauchement de parcours
     """
-    print("\n[MÉTHODE 4] Hybride (heading + distance)")
+    print("\n[MÉTHODE] Hybride (heading + distance)")
 
     coords = df[["lat_deg", "lon_deg"]].dropna()
     if len(coords) < 50:
@@ -218,7 +216,6 @@ def method_hybrid_heading_distance(df, edge_pct=EDGE_PERCENT, heading_threshold=
 
     # 3. Parmi les candidats, choisir celui le plus éloigné du départ
     start_point = coords.iloc[0].values
-
     best_candidate = None
     max_distance = -1
 
@@ -239,47 +236,13 @@ def method_hybrid_heading_distance(df, edge_pct=EDGE_PERCENT, heading_threshold=
 
     return turnaround_idx
 
-def method_distance_variance(df, edge_pct=EDGE_PERCENT):
-    """
-    Détecte le demi-tour comme le point où la variance des distances
-    aux autres points change drastiquement.
-    """
-    print("\n[MÉTHODE 5] Variance de distance")
-
-    coords = df[["lat_deg", "lon_deg"]].dropna()
-    if len(coords) < 50:
-        print("✗ Pas assez de points GPS")
-        return None
-
-    coord_indices = coords.index.tolist()
-    total_points = len(coord_indices)
-    edge_n = max(10, int(total_points * edge_pct))
-
-    # Calculer la matrice de distances
-    distances_matrix = cdist(coords.values, coords.values, metric='euclidean')
-
-    # Pour chaque point, calculer la variance des distances aux autres points
-    variances = np.var(distances_matrix, axis=1)
-
-    # Exclure les bords
-    variances[:edge_n] = -np.inf
-    variances[-edge_n:] = -np.inf
-
-    # Le demi-tour est le point de variance maximale
-    max_var_pos = np.argmax(variances)
-    turnaround_idx = coord_indices[max_var_pos]
-
-    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
-    print(f"  Variance maximale : {variances[max_var_pos]:.6f}")
-
-    return turnaround_idx
 
 def method_temporal_inversion(df, edge_pct=EDGE_PERCENT):
     """
     Détecte le demi-tour en identifiant le changement de direction temporelle
-    des correspondances spatiales (méthode précédente).
+    des correspondances spatiales.
     """
-    print("\n[MÉTHODE 6] Inversion de direction temporelle")
+    print("\n[MÉTHODE] Inversion de direction temporelle")
 
     coords = df[["lat_deg", "lon_deg"]].dropna()
     if len(coords) < 50:
@@ -293,6 +256,7 @@ def method_temporal_inversion(df, edge_pct=EDGE_PERCENT):
     coords_array = coords.values
     distances_matrix = cdist(coords_array, coords_array, metric='euclidean')
 
+    OVERLAP_THRESHOLD = 0.001  # ~100m en degrés
     temporal_directions = []
 
     for i in range(edge_n, total_points - edge_n):
@@ -341,58 +305,11 @@ def method_temporal_inversion(df, edge_pct=EDGE_PERCENT):
     return turnaround_idx
 
 
-def refine_turn_by_local_curvature(df, start, end):
-    coords = df[["lat_deg", "lon_deg"]].iloc[start:end].values
-    if len(coords) < 5:
-        return None
-
-    x = gaussian_filter1d(coords[:, 0], sigma=3)
-    y = gaussian_filter1d(coords[:, 1], sigma=3)
-
-    dx = np.gradient(x)
-    dy = np.gradient(y)
-    ddx = np.gradient(dx)
-    ddy = np.gradient(dy)
-
-    curvature = np.sqrt(ddx ** 2 + ddy ** 2)
-
-    local_idx = np.argmax(curvature)
-    return df.index[start + local_idx]
-
-
 def get_candidate_window(i0, n, window_size=40):
+    """Définit une fenêtre autour du candidat pour l'affinage."""
     start = max(0, i0 - window_size)
     end = min(n, i0 + window_size + 1)
     return start, end
-
-
-def refine_turn_by_spatial_curvature(df, start, end):
-    coords = df[["lat_deg", "lon_deg"]].iloc[start:end].values
-    if len(coords) < 5:
-        return None
-
-    # recentrage
-    coords -= coords.mean(axis=0)
-
-    x = gaussian_filter1d(coords[:, 0], sigma=3)
-    y = gaussian_filter1d(coords[:, 1], sigma=3)
-
-    # paramétrisation spatiale
-    ds = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
-    s = np.concatenate([[0], np.cumsum(ds)])
-    if s[-1] == 0:
-        return None
-    s /= s[-1]
-
-    dx = np.gradient(x, s)
-    dy = np.gradient(y, s)
-    ddx = np.gradient(dx, s)
-    ddy = np.gradient(dy, s)
-
-    curvature = np.abs(dx * ddy - dy * ddx) / (dx ** 2 + dy ** 2 + 1e-12) ** 1.5
-
-    local_idx = np.argmax(curvature)
-    return df.index[start + local_idx]
 
 
 def refine_turn_by_spatial_curvature_real(df, start, end):
@@ -412,7 +329,7 @@ def refine_turn_by_spatial_curvature_real(df, start, end):
     x = gaussian_filter1d(coords[:, 0], sigma=2)
     y = gaussian_filter1d(coords[:, 1], sigma=2)
 
-    # Paramétrisation par longueur d’arc s
+    # Paramétrisation par longueur d'arc s
     dx_raw = np.diff(x)
     dy_raw = np.diff(y)
     ds = np.sqrt(dx_raw ** 2 + dy_raw ** 2)
@@ -438,7 +355,9 @@ def refine_turn_by_spatial_curvature_real(df, start, end):
     local_pos = np.argmax(curvature)
     return df.index[start + local_pos]
 
+
 def method_dynamic_centroid_refined(df, edge_pct=EDGE_PERCENT, window_size=40):
+    """Centroïde dynamique avec raffinement intégré."""
     print("\n[MÉTHODE] Dynamic centroid + affinement local")
 
     i0 = method_dynamic_centroid(df, edge_pct)
@@ -450,9 +369,6 @@ def method_dynamic_centroid_refined(df, edge_pct=EDGE_PERCENT, window_size=40):
     pos = idx_list.index(i0)
 
     start, end = get_candidate_window(pos, len(idx_list), window_size)
-
-    # refined_idx = refine_turn_by_local_curvature(df, start, end)
-    # refined_idx = refine_turn_by_spatial_curvature(df, start, end)
     refined_idx = refine_turn_by_spatial_curvature_real(df, start, end)
 
     if refined_idx is not None:
@@ -462,8 +378,10 @@ def method_dynamic_centroid_refined(df, edge_pct=EDGE_PERCENT, window_size=40):
     print("⚠ Affinage échoué, retour du point centroid")
     return i0
 
+
 def method_dynamic_centroid(df, edge_pct=EDGE_PERCENT):
-    print("\n[MÉTHODE F] Centroïde dynamique")
+    """Détecte le point le plus éloigné du centroïde dynamique."""
+    print("\n[MÉTHODE] Centroïde dynamique")
 
     coords = df[["lat_deg", "lon_deg"]].dropna().values
     n = len(coords)
@@ -479,8 +397,10 @@ def method_dynamic_centroid(df, edge_pct=EDGE_PERCENT):
     print(f"✓ Demi-tour à {df.index[idx]}")
     return df.index[idx]
 
+
 def method_pca_extremum(df, edge_pct=EDGE_PERCENT):
-    print("\n[MÉTHODE E] Extremum PCA")
+    """Détecte le point extrême sur l'axe principal (PCA)."""
+    print("\n[MÉTHODE] Extremum PCA")
 
     coords = df[["lat_deg", "lon_deg"]].dropna().values
     coords -= coords.mean(axis=0)
@@ -497,8 +417,10 @@ def method_pca_extremum(df, edge_pct=EDGE_PERCENT):
     print(f"✓ Demi-tour à {df.index[idx]}")
     return df.index[idx]
 
+
 def method_path_symmetry(df, edge_pct=EDGE_PERCENT):
-    print("\n[MÉTHODE D] Symétrie de trajectoire")
+    """Détecte le point de symétrie minimale aller/retour."""
+    print("\n[MÉTHODE] Symétrie de trajectoire")
 
     coords = df[["lat_deg", "lon_deg"]].dropna().values
     n = len(coords)
@@ -516,8 +438,10 @@ def method_path_symmetry(df, edge_pct=EDGE_PERCENT):
     print(f"✓ Demi-tour à {df.index[idx]}")
     return df.index[idx]
 
+
 def method_nearest_neighbor_inversion(df, edge_pct=EDGE_PERCENT):
-    print("\n[MÉTHODE C] Inversion du voisin temporel")
+    """Détecte l'inversion du signe du plus proche voisin."""
+    print("\n[MÉTHODE] Inversion du voisin temporel")
 
     coords = df[["lat_deg", "lon_deg"]].dropna().values
     n = len(coords)
@@ -540,8 +464,10 @@ def method_nearest_neighbor_inversion(df, edge_pct=EDGE_PERCENT):
 
     return None
 
+
 def method_self_overlap(df, edge_pct=EDGE_PERCENT):
-    print("\n[MÉTHODE B] Auto-recouvrement spatial")
+    """Détecte le point où le chemin passé et futur se croisent."""
+    print("\n[MÉTHODE] Auto-recouvrement spatial")
 
     coords = df[["lat_deg", "lon_deg"]].dropna().values
     n = len(coords)
@@ -562,8 +488,10 @@ def method_self_overlap(df, edge_pct=EDGE_PERCENT):
     print(f"✓ Demi-tour à {df.index[idx]}")
     return df.index[idx]
 
+
 def method_distance_to_past_path(df, edge_pct=EDGE_PERCENT):
-    print("\n[MÉTHODE A] Distance au chemin passé")
+    """Détecte le premier point qui se rapproche du chemin passé (CORRIGÉ)."""
+    print("\n[MÉTHODE] Distance au chemin passé")
 
     coords = df[["lat_deg", "lon_deg"]].dropna().values
     n = len(coords)
@@ -578,21 +506,20 @@ def method_distance_to_past_path(df, edge_pct=EDGE_PERCENT):
         dists = cdist([coords[i]], past)
         scores[i] = np.min(dists)
 
-    scores[:edge_n] = -np.inf
-    scores[-edge_n:] = -np.inf
+    scores[:edge_n] = np.inf
+    scores[-edge_n:] = np.inf
 
-    idx = np.argmax(scores)
+    idx = np.argmin(scores)
     print(f"✓ Demi-tour à {df.index[idx]}")
     return df.index[idx]
 
 
 def get_turnaround_method(method=None):
+    """Retourne la fonction correspondant à la méthode demandée."""
     methods_map = {
-        "furthest_point": method_furthest_point,
         "cumulative_distance": method_cumulative_distance,
         "3d_curvature": method_3d_curvature,
         "hybrid": method_hybrid_heading_distance,
-        "variance": method_distance_variance,
         "temporal_inversion": method_temporal_inversion,
         "distance_to_path": method_distance_to_past_path,
         "self_overlap": method_self_overlap,
@@ -611,8 +538,27 @@ def get_turnaround_method(method=None):
         return methods_map.keys()
 
 
-def detect_turnaround_method(df, edge_pct=EDGE_PERCENT, method=DEFAULT_METHOD):
-    try:
-        return get_turnaround_method(method)(df, edge_pct)
-    except:
-        raise ValueError(f"Méthode '{method}' inconnue. Disponibles : {', '.join(get_turnaround_method())}")
+def detect_turnaround_method(df, edge_pct=EDGE_PERCENT, method=DEFAULT_METHOD, refine=False):
+    """
+    Détecte le point de demi-tour avec la méthode spécifiée.
+
+    Args:
+        df: DataFrame avec colonnes lat_deg, lon_deg
+        edge_pct: Pourcentage des bords à exclure
+        method: Nom de la méthode à utiliser
+        refine: Si True, applique le raffinement par courbure (sauf si déjà raffiné)
+
+    Returns:
+        Index du point de demi-tour détecté
+    """
+    method_func = get_turnaround_method(method)
+
+    if not method_func:
+        available = ', '.join(get_turnaround_method())
+        raise ValueError(f"Méthode '{method}' inconnue. Disponibles : {available}")
+
+    # Si refine=True et que la méthode n'est pas déjà raffinée
+    if refine and not method.endswith('_refined'):
+        method_func = apply_refinement(method_func)
+
+    return method_func(df, edge_pct)
