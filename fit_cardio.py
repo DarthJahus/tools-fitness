@@ -330,7 +330,7 @@ def get_zone_color(hr, zones):
     return "grey"
 
 
-def analyze_slopes(df, peaks, zones):
+def analyze_slopes(df, peaks):
     """
     Analyze heart rate slopes around peaks.
 
