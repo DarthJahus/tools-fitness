@@ -50,38 +50,6 @@ def calculate_heading(lat1, lon1, lat2, lon2):
     return np.degrees(heading) % 360
 
 
-def method_cumulative_distance(df, edge_pct=EDGE_PERCENT):
-    """
-    Détecte le demi-tour comme le point où la distance GPS cumulée atteint
-    son maximum (ne fonctionne que si la distance décroît au retour).
-    """
-    print("\n[MÉTHODE] Distance GPS cumulée maximale")
-
-    if "distance" not in df.columns or df["distance"].isna().all():
-        print("✗ Pas de données de distance")
-        return None
-
-    distances = df["distance"].dropna()
-    if len(distances) < 50:
-        print("✗ Pas assez de points avec distance")
-        return None
-
-    edge_n = max(10, int(len(distances) * edge_pct))
-
-    # Exclure les bords
-    distances_copy = distances.copy()
-    distances_copy.iloc[:edge_n] = -np.inf
-    distances_copy.iloc[-edge_n:] = -np.inf
-
-    turnaround_idx = distances_copy.idxmax()
-    max_dist_km = distances.loc[turnaround_idx] / 1000
-
-    print(f"✓ Demi-tour détecté à l'indice {turnaround_idx}")
-    print(f"  Distance cumulée : {max_dist_km:.2f} km")
-
-    return turnaround_idx
-
-
 def method_3d_curvature(df, edge_pct=EDGE_PERCENT):
     """
     Détecte le demi-tour comme le point de courbure maximale dans l'espace
@@ -101,7 +69,6 @@ def method_3d_curvature(df, edge_pct=EDGE_PERCENT):
     # Construire la trajectoire 3D : (x, y, t_normalized)
     x = coords.values[:, 0]
     y = coords.values[:, 1]
-    t = np.linspace(0, 1, total_points)  # Temps normalisé [0, 1]
 
     # Lisser les coordonnées pour réduire le bruit
     x_smooth = gaussian_filter1d(x, sigma=5)
@@ -110,7 +77,6 @@ def method_3d_curvature(df, edge_pct=EDGE_PERCENT):
     # Calculer les dérivées premières (vitesse)
     dx = np.gradient(x_smooth)
     dy = np.gradient(y_smooth)
-    dt = np.gradient(t)
 
     # Calculer les dérivées secondes (accélération)
     ddx = np.gradient(dx)
@@ -398,26 +364,6 @@ def method_dynamic_centroid(df, edge_pct=EDGE_PERCENT):
     return df.index[idx]
 
 
-def method_pca_extremum(df, edge_pct=EDGE_PERCENT):
-    """Détecte le point extrême sur l'axe principal (PCA)."""
-    print("\n[MÉTHODE] Extremum PCA")
-
-    coords = df[["lat_deg", "lon_deg"]].dropna().values
-    coords -= coords.mean(axis=0)
-
-    u, s, vh = np.linalg.svd(coords, full_matrices=False)
-    proj = u[:, 0] * s[0]
-
-    n = len(proj)
-    edge_n = max(10, int(n * edge_pct))
-    proj[:edge_n] = -np.inf
-    proj[-edge_n:] = -np.inf
-
-    idx = np.argmax(np.abs(proj))
-    print(f"✓ Demi-tour à {df.index[idx]}")
-    return df.index[idx]
-
-
 def method_path_symmetry(df, edge_pct=EDGE_PERCENT):
     """Détecte le point de symétrie minimale aller/retour."""
     print("\n[MÉTHODE] Symétrie de trajectoire")
@@ -437,32 +383,6 @@ def method_path_symmetry(df, edge_pct=EDGE_PERCENT):
     idx = np.argmin(scores)
     print(f"✓ Demi-tour à {df.index[idx]}")
     return df.index[idx]
-
-
-def method_nearest_neighbor_inversion(df, edge_pct=EDGE_PERCENT):
-    """Détecte l'inversion du signe du plus proche voisin."""
-    print("\n[MÉTHODE] Inversion du voisin temporel")
-
-    coords = df[["lat_deg", "lon_deg"]].dropna().values
-    n = len(coords)
-    edge_n = max(10, int(n * edge_pct))
-
-    mat = cdist(coords, coords)
-    np.fill_diagonal(mat, np.inf)
-
-    signs = []
-
-    for i in range(edge_n, n - edge_n):
-        j = np.argmin(mat[i])
-        signs.append((i, np.sign(j - i)))
-
-    for k in range(len(signs) - 1):
-        if signs[k][1] > 0 and signs[k + 1][1] < 0:
-            idx = signs[k][0]
-            print(f"✓ Demi-tour à {df.index[idx]}")
-            return df.index[idx]
-
-    return None
 
 
 def method_self_overlap(df, edge_pct=EDGE_PERCENT):
@@ -514,18 +434,43 @@ def method_distance_to_past_path(df, edge_pct=EDGE_PERCENT):
     return df.index[idx]
 
 
+def turnaround_error_score(position_pct,
+                           dist_to_start,
+                           dist_to_end,
+                           start_to_end_dist):
+    """
+    Score d'incohérence du demi-tour.
+    Plus il est élevé, moins la détection est crédible.
+    """
+
+    score = 0.0
+
+    # Trop proche du début ou de la fin
+    if position_pct < 0.10:
+        score += (0.10 - position_pct) * 2.0
+    if position_pct > 0.90:
+        score += (position_pct - 0.90) * 2.0
+
+    # Trop proche du départ ET de l'arrivée
+    if dist_to_start < 1.0 and dist_to_end < 1.0:
+        score += 1.0
+
+    # Départ et arrivée quasi confondus
+    if start_to_end_dist < 0.3:
+        score += 1.0
+
+    return score
+
+
 def get_turnaround_method(method=None):
     """Retourne la fonction correspondant à la méthode demandée."""
     methods_map = {
-        "cumulative_distance": method_cumulative_distance,
         "3d_curvature": method_3d_curvature,
         "hybrid": method_hybrid_heading_distance,
         "temporal_inversion": method_temporal_inversion,
         "distance_to_path": method_distance_to_past_path,
         "self_overlap": method_self_overlap,
-        "nn_inversion": method_nearest_neighbor_inversion,
         "symmetry": method_path_symmetry,
-        "pca": method_pca_extremum,
         "dynamic_centroid": method_dynamic_centroid,
         "dynamic_centroid_refined": method_dynamic_centroid_refined
     }
