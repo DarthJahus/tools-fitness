@@ -80,7 +80,7 @@ Examples:
     parser.add_argument(
         '--no-laps',
         action='store_true',
-        help='Display lap markers on the chart'
+        help='Do not display lap markers on the chart'
     )
 
     return parser.parse_args()
@@ -633,7 +633,7 @@ def main():
 
     else:
         # Manual zones (default if nothing specified)
-        zones_str = args.zones if args.zones else '112,124,136,149,161'
+        zones_str = args.zones if args.zones else '101,118,133,149,162'
         zone_boundaries = parse_zones(zones_str)
         print(f"Using manual zones: {zone_boundaries}")
 
