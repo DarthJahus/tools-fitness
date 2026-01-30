@@ -426,9 +426,25 @@ def plot_heart_rate(df, zones, peaks, lap_times_s=None):
 
     # Plot lap markers if provided
     if lap_times_s:
+        ax = plt.gca()
         for i, t in enumerate(lap_times_s):
-            label = "Laps" if i == 0 else None
-            plt.axvline(x=t / 60, color="black", linestyle="--", linewidth=1, alpha=0.6, label=label)
+            ax.axvline(
+                x=t / 60,
+                color="black",
+                linestyle="--",
+                linewidth=1,
+                alpha=0.6
+            )
+            ax.text(
+                t / 60,
+                0.01,  # 1 % au-dessus de l'axe X
+                f"    L{i + 1}",
+                transform=ax.get_xaxis_transform(),
+                ha="left",
+                va="bottom",
+                fontsize=7,
+                alpha=0.7
+            )
 
     # Analyze and plot slopes on the SAME figure
     adapt_up = fatigue_up = neutral_up = 0
