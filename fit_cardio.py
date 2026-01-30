@@ -17,6 +17,8 @@ from scipy.signal import find_peaks
 import argparse
 import sys
 from pathlib import Path
+import zipfile
+import io
 
 __no_mini_label = True
 
@@ -252,16 +254,31 @@ def create_zone_dict(zone_boundaries, user_max_hr=None, data_max_hr=None):
     return zones
 
 
-def load_fit_file(file_path):
+def open_zip(zip_path):
+    """Extract and return .fit file from ZIP archive."""
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        fit_files = [f for f in z.namelist() if f.lower().endswith('.fit')]
+        if not fit_files:
+            print("Error: No .fit file found in ZIP archive")
+            sys.exit(1)
+        print(f"Found {len(fit_files)} .FIT files in ZIP archive:")
+        print(f"  - " + '\n  - '.join(fit_files))
+        if len(fit_files) > 1:
+            print(f"Only the first file will be handled: {fit_files[0]}")
+        return io.BytesIO(z.read(fit_files[0]))
+
+
+def load_fit_file(file_source):
     """Load heart rate data and laps from FIT file."""
-    if not Path(file_path).exists():
-        print(f"Error: File not found: {file_path}")
-        sys.exit(1)
+    if isinstance(file_source, (str, Path)):
+        if not Path(file_source).exists():
+            print(f"Error: File not found: {file_source}")
+            sys.exit(1)
 
     records = []
     laps = []
 
-    with fitdecode.FitReader(file_path) as fit:
+    with fitdecode.FitReader(file_source) as fit:
         for frame in fit:
             if frame.frame_type == fitdecode.FIT_FRAME_DATA:
                 if frame.name == "record":
@@ -553,7 +570,14 @@ def main():
 
     # Load and prepare data first (we need max HR for zone calculation)
     print(f"Loading FIT file: {args.file}")
-    df, laps = load_fit_file(args.file)
+
+    # Handle ZIP or FIT files
+    if args.file.lower().endswith('.zip'):
+        file_source = open_zip(args.file)
+    else:
+        file_source = args.file
+
+    df, laps = load_fit_file(file_source)
     df = prepare_data(df)
 
     # Convert laps to time if show-laps is enabled
