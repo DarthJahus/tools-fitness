@@ -75,6 +75,11 @@ Examples:
         type=int,
         help='Calculate max HR from age using 220-age formula, then compute zones'
     )
+    parser.add_argument(
+        '--no-laps',
+        action='store_true',
+        help='Display lap markers on the chart'
+    )
 
     return parser.parse_args()
 
@@ -248,45 +253,39 @@ def create_zone_dict(zone_boundaries, user_max_hr=None, data_max_hr=None):
 
 
 def load_fit_file(file_path):
-    """
-    Load and parse FIT file.
-
-    Args:
-        file_path: Path to FIT file
-
-    Returns:
-        pandas DataFrame with heart rate records
-    """
-    # Check if file exists
+    """Load heart rate data and laps from FIT file."""
     if not Path(file_path).exists():
         print(f"Error: File not found: {file_path}")
         sys.exit(1)
 
-    # Load FIT file
     records = []
-    try:
-        with fitdecode.FitReader(file_path) as fit:
-            for frame in fit:
-                if frame.frame_type == fitdecode.FIT_FRAME_DATA and frame.name == "record":
-                    record = {field.name: field.value for field in frame.fields}
-                    records.append(record)
-    except Exception as e:
-        print(f"Error: Failed to read FIT file: {e}")
-        sys.exit(1)
+    laps = []
 
-    if not records:
-        print("Error: No heart rate records found in FIT file")
-        sys.exit(1)
+    with fitdecode.FitReader(file_path) as fit:
+        for frame in fit:
+            if frame.frame_type == fitdecode.FIT_FRAME_DATA:
+                if frame.name == "record":
+                    record_data = {field.name: field.value for field in frame.fields}
+                    if "heart_rate" in record_data and "timestamp" in record_data:
+                        records.append(record_data)
+                elif frame.name == "lap":
+                    lap_data = {field.name: field.value for field in frame.fields}
+                    if "start_time" in lap_data:
+                        laps.append(pd.to_datetime(lap_data["start_time"]))
 
-    # Create DataFrame
-    df = pd.DataFrame(records)
+    return pd.DataFrame(records), laps
 
-    # Check if heart_rate column exists
-    if "heart_rate" not in df.columns:
-        print("Error: No heart rate data found in FIT file")
-        sys.exit(1)
 
-    return df
+def laps_to_time_s(laps, df):
+    """Convert lap timestamps to seconds since activity start."""
+    if not laps:
+        return None
+    start_time = df["timestamp"].iloc[0]
+    return [
+        (lap - start_time).total_seconds()
+        for lap in laps
+        if lap >= start_time
+    ]
 
 
 def prepare_data(df):
@@ -391,7 +390,7 @@ def analyze_slopes(df, peaks):
     return adapt_up, fatigue_up, neutral_up, adapt_down, fatigue_down, neutral_down
 
 
-def plot_heart_rate(df, zones, peaks):
+def plot_heart_rate(df, zones, peaks, lap_times_s=None):
     """Create heart rate visualization with zones and analysis."""
     # Assign zone colors
     df["zone_color"] = df["heart_rate"].apply(lambda hr: get_zone_color(hr, zones))
@@ -407,6 +406,12 @@ def plot_heart_rate(df, zones, peaks):
         # Don't add Zone 0 to legend (warmup/recovery zone)
         legend_label = label if not label.startswith("Zone 0") else None
         plt.axhspan(low, high, color=color, alpha=0.1, label=legend_label)
+
+    # Plot lap markers if provided
+    if lap_times_s:
+        for i, t in enumerate(lap_times_s):
+            label = "Laps" if i == 0 else None
+            plt.axvline(x=t / 60, color="black", linestyle="--", linewidth=1, alpha=0.6, label=label)
 
     # Analyze and plot slopes on the SAME figure
     adapt_up = fatigue_up = neutral_up = 0
@@ -548,8 +553,17 @@ def main():
 
     # Load and prepare data first (we need max HR for zone calculation)
     print(f"Loading FIT file: {args.file}")
-    df = load_fit_file(args.file)
+    df, laps = load_fit_file(args.file)
     df = prepare_data(df)
+
+    # Convert laps to time if show-laps is enabled
+    lap_times_s = None
+    if not args.no_laps:
+        if laps:
+            lap_times_s = laps_to_time_s(laps, df)
+            print(f"Found {len(lap_times_s)} laps")
+        else:
+            print(f"No laps data found.")
 
     # Get max HR from dataset
     data_max_hr = df["heart_rate"].dropna().max()
@@ -591,7 +605,7 @@ def main():
     print(f"Found {len(peaks)} heart rate peaks")
 
     # Create visualization (slopes are analyzed within the plot function)
-    plot_heart_rate(df, zones, peaks)
+    plot_heart_rate(df, zones, peaks, lap_times_s)
 
 
 if __name__ == "__main__":
