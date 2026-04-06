@@ -153,7 +153,7 @@ def sliding_hrv(timestamps, rr, window_min):
 
 # ─────────────────────────────────────────────────────────────
 
-def run(path, window_min, use_marker, use_full):
+def run(path, window_min, use_marker, use_full, no_gru):
 
     log("[init] discovering files")
 
@@ -195,42 +195,6 @@ def run(path, window_min, use_marker, use_full):
     log(f"  RMSSD: {rmssd_full:.1f} ms")
     log(f"  SDNN : {sdnn_full:.1f} ms")
     log(f"  HR   : {hr_full:.1f} bpm")
-
-    # ─────────────────────────
-    # GRAPH OVERVIEW (FIXED)
-    # ─────────────────────────
-    fig, ax1 = plt.subplots(figsize=(14, 5))
-
-    ax1.plot(times, rmssd, label="RMSSD (ms)", color="tab:blue")
-    ax1.set_ylabel("RMSSD (ms)")
-
-    ax2 = ax1.twinx()
-    ax2.plot(times, hr, linestyle="--", label="HR (bpm)", color="tab:red")
-    ax2.set_ylabel("HR (bpm)")
-
-    # marker overlay VISUEL uniquement
-    if m_start:
-        ax1.axvline(m_start, linestyle="--", color="green", label="Marker START")
-    if m_stop:
-        ax1.axvline(m_stop, linestyle="--", color="orange", label="Marker STOP")
-
-    # fusion légendes
-    lines = ax1.get_lines() + ax2.get_lines()
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels)
-
-    title = "Sleep overview (FULL NIGHT)"
-    if m_start and m_stop:
-        title += f"\nMarker: {m_start.strftime('%H:%M')} → {m_stop.strftime('%H:%M')}"
-
-    plt.title(title)
-    plt.tight_layout()
-    plt.show()
-
-    log("\n[graph] Sleep overview:")
-    log("  RMSSD ↑ = récupération parasympathique")
-    log("  HR ↓ = repos profond")
-    log("  HR↑ + RMSSD↓ = stress / activation")
 
     # ECG
     plot_ecg_segment(ts_ecg, ecg, m_start, m_stop)
@@ -276,6 +240,14 @@ def run(path, window_min, use_marker, use_full):
     log("  nuage serré = rigidité cardiaque")
 
     # ─────────────────────────
+    # SLEEP STAGING
+    # ─────────────────────────
+    if no_gru:
+        sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr)
+    else:
+        sleep_staging(ecg, SR, ts_ecg, times, rmssd, hr)
+
+    # ─────────────────────────
     # NEUROKIT (OPTIONNEL)
     # ─────────────────────────
     if use_full:
@@ -288,10 +260,225 @@ def run(path, window_min, use_marker, use_full):
             log("[core] no valid marker → using full RR (slow)")
             rr_nk = rr
 
-        peaks_idx = np.round(np.cumsum(rr_nk)).astype(int)
+        log(f"[core] nk.hrv on {len(rr_nk)} beats")
+        # cumsum en ms → indices à 1000 Hz
+        peaks_idx = np.concatenate([[0], np.round(np.cumsum(rr_nk)).astype(int)])
         nk.hrv(peaks_idx, sampling_rate=1000, show=True)
+        plt.tight_layout()
+        plt.show()
 
 # ─────────────────────────────────────────────────────────────
+
+def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr):
+    from collections import Counter
+    from matplotlib.patches import Patch
+
+    EPOCH_S  = 30
+    epoch_td = timedelta(seconds=EPOCH_S)
+
+    log("\n[sleep] rule-based sleep staging (30s epochs)")
+    log(f"[sleep] {len(rr):,} RR intervals available")
+
+    epochs_ts, labels = [], []
+    t     = rr_ts[0]
+    t_end = rr_ts[-1]
+
+    while t + epoch_td <= t_end:
+        mask = (rr_ts >= t) & (rr_ts < t + epoch_td)
+        w = rr[mask]
+        if len(w) < 5:
+            t += epoch_td
+            continue
+        diff  = np.diff(w)
+        rmssd_e = np.sqrt(np.mean(diff**2)) if len(diff) > 0 else 0
+        hr_e    = 60000 / np.mean(w)
+        if hr_e > 65 and rmssd_e < 25:
+            label = "WAKE"
+        elif rmssd_e > 70:
+            label = "N3"
+        elif rmssd_e > 45:
+            label = "REM"
+        elif rmssd_e > 25:
+            label = "N2"
+        else:
+            label = "N1"
+        epochs_ts.append(t)
+        labels.append(label)
+        t += epoch_td
+
+    stage_labels_order = ["WAKE", "N1", "N2", "REM", "N3"]
+    counts = Counter(labels)
+    total  = len(labels)
+    log(f"\n[sleep] {total} epochs × 30s = {total*30/3600:.1f}h")
+    for stage in stage_labels_order:
+        count = counts.get(stage, 0)
+        log(f"  {stage:5s}: {count:4d} = {count*30/60:5.1f} min ({count/total*100:.1f}%)")
+
+    stage_colors = {
+        "WAKE": "#e74c3c",
+        "REM":  "#9b59b6",
+        "N1":   "#3498db",
+        "N2":   "#2ecc71",
+        "N3":   "#1a5276",
+    }
+
+    epochs_ts_np = np.array(epochs_ts)
+
+    def get_stage_for_time(t):
+        idx = np.searchsorted(epochs_ts_np, t, side="right") - 1
+        idx = max(0, min(idx, len(labels) - 1))
+        return labels[idx]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
+                                    gridspec_kw={"height_ratios": [2, 1]})
+    fig.suptitle("Sleep overview — RMSSD/HR + hypnogram (rule-based)")
+
+    for i in range(len(times) - 1):
+        t0, t1  = times[i], times[i+1]
+        stage   = get_stage_for_time(t0)
+        color   = stage_colors.get(stage, "#888888")
+        ax1.fill_betweenx([0, max(rmssd)*1.1], t0, t1, color=color, alpha=0.15)
+
+    ax1.plot(times, rmssd, color="tab:blue", linewidth=1.2, label="RMSSD (ms)", zorder=3)
+    ax1b = ax1.twinx()
+    ax1b.plot(times, hr, color="tab:red", linewidth=1.0, alpha=0.7,
+              linestyle="--", label="HR (bpm)", zorder=2)
+    ax1.set_ylabel("RMSSD (ms)", color="tab:blue")
+    ax1b.set_ylabel("HR (bpm)", color="tab:red")
+
+    patches = [Patch(color=stage_colors[l], label=l) for l in stage_labels_order]
+    ax1.legend(handles=patches + ax1.get_lines() + ax1b.get_lines(),
+               loc="upper right", fontsize=8)
+
+    stage_y = {"WAKE": 4, "REM": 3, "N1": 2, "N2": 1, "N3": 0}
+    y_vals  = [stage_y[l] for l in labels]
+
+    ax2.step(epochs_ts, y_vals, where="post", color="tab:blue", linewidth=0.8)
+    ax2.set_yticks([0,1,2,3,4])
+    ax2.set_yticklabels(["N3","N2","N1","REM","WAKE"])
+    ax2.set_ylabel("Stage")
+    ax2.set_xlabel("Time")
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.show()
+
+
+def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
+    import sleepecg
+    import os, logging, warnings
+
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+    log("\n[sleep] detecting heartbeats (Pan-Tompkins)…")
+    beats = sleepecg.detect_heartbeats(ecg, sr)
+    log(f"[sleep] beats detected: {len(beats):,}")
+
+    beat_times = beats / sr
+
+    # datetime complet requis
+    record = sleepecg.SleepRecord(
+        sleep_stage_duration=30,
+        recording_start_time=ts_ecg[0],  # datetime complet
+        heartbeat_times=beat_times,
+    )
+
+    log("[sleep] loading classifier wrn-gru-mesa…")
+    clf = sleepecg.load_classifier("wrn-gru-mesa", "SleepECG")
+    log(f"[sleep] stages_mode: {clf.stages_mode}")
+
+    log("[sleep] classifying stages…")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        stages_pred = sleepecg.stage(clf, record, return_mode="int")
+
+    # stages_mode est une string ex: "wake-rem-nrem" ou "wake-sleep"
+    log(f"[sleep] stages_mode raw: {clf.stages_mode}")
+
+    STAGE_MAPS = {
+        "wake-rem-nrem": {0: "WAKE", 1: "REM", 2: "NREM"},
+        "wake-sleep": {0: "WAKE", 1: "SLEEP"},
+        "wake-rem-light-deep": {0: "WAKE", 1: "REM", 2: "LIGHT", 3: "DEEP"},
+    }
+
+    stage_map = STAGE_MAPS.get(clf.stages_mode, None)
+    if stage_map is None:
+        log(f"[sleep] unknown stages_mode '{clf.stages_mode}', using raw indices")
+        stage_map = {i: str(i) for i in range(10)}
+
+    stage_labels = list(stage_map.values())
+    log(f"[sleep] stages mapped: {stage_labels}")
+
+    # Stats
+    from collections import Counter
+    labels_str = [stage_map.get(int(s), "?") for s in stages_pred]
+    counts = Counter(labels_str)
+    total = len(labels_str)
+    log(f"\n[sleep] {total} epochs × 30s = {total * 30 / 3600:.1f}h")
+    for label in stage_labels:
+        count = counts.get(label, 0)
+        log(f"  {label:6s}: {count:4d} = {count * 30 / 60:5.1f} min ({count / total * 100:.1f}%)")
+
+    # Timestamps des epochs
+    epoch_times = [ts_ecg[0] + timedelta(seconds=i*30) for i in range(len(stages_pred))]
+
+    # Colorisation du graphique nuit
+    stage_colors = {
+        "WAKE": "#e74c3c",  # rouge
+        "REM": "#9b59b6",  # violet
+        "NREM": "#2980b9",  # bleu
+        "LIGHT": "#3498db",  # bleu clair
+        "DEEP": "#1a5276",  # bleu foncé
+        "SLEEP": "#27ae60",  # vert
+        "N1": "#5dade2",
+        "N2": "#2ecc71",
+        "N3": "#1a5276",
+    }
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
+                                    gridspec_kw={"height_ratios": [2, 1]})
+    fig.suptitle("Sleep overview — RMSSD/HR + hypnogram")
+    epoch_times_np = np.array(epoch_times)
+
+    def get_stage_for_time(t):
+        idx = np.searchsorted(epoch_times_np, t, side="right") - 1
+        idx = max(0, min(idx, len(labels_str) - 1))
+        return labels_str[idx]
+
+    for i in range(len(times) - 1):
+        t0, t1 = times[i], times[i + 1]
+        stage = get_stage_for_time(t0)
+        color = stage_colors.get(stage, "#aaaaaa")
+        ax1.fill_betweenx([0, max(rmssd) * 1.1], t0, t1, color=color, alpha=0.2)
+
+    ax1.plot(times, rmssd, color="white", linewidth=1.2, label="RMSSD (ms)", zorder=3)
+    ax1b = ax1.twinx()
+    ax1b.plot(times, hr, color="#f39c12", linewidth=1.0, alpha=0.9,
+              linestyle="--", label="HR (bpm)", zorder=2)
+    ax1.set_ylabel("RMSSD (ms)")
+    ax1b.set_ylabel("HR (bpm)")
+
+    from matplotlib.patches import Patch
+    patches = [Patch(color=stage_colors.get(l, "#aaa"), label=l) for l in stage_labels]
+    ax1.legend(handles=patches + ax1.get_lines() + ax1b.get_lines(),
+               loc="upper right", fontsize=8)
+
+    stage_y = {l: i for i, l in enumerate(reversed(stage_labels))}
+    y_vals = [stage_y.get(l, 0) for l in labels_str]
+
+    ax2.step(epoch_times, y_vals, where="post", color="#3498db", linewidth=0.8)
+    ax2.set_yticks(list(stage_y.values()))
+    ax2.set_yticklabels(list(stage_y.keys()))
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.show()
+
+# ─────────────────────────────────────────────────────────────
+
 
 def main():
     description = """
@@ -316,6 +503,7 @@ Useful reading:
     p.add_argument("--no-marker", action="store_true",
                    help="Ignore marker file → analyze full recording")
 
+    p.add_argument("--no-gru", action="store_true", help="Use rule-based hypnogram, without TensorFlow/GRU")
     p.add_argument("--full", action="store_true",
                    help="Run NeuroKit full HRV analysis (slow)")
 
@@ -325,7 +513,8 @@ Useful reading:
         args.path,
         args.window,
         use_marker=not args.no_marker,
-        use_full=args.full
+        use_full=args.full,
+        no_gru=args.no_gru
     )
 
 if __name__ == "__main__":
