@@ -1,363 +1,332 @@
-import sys
+import os
+import glob
 import csv
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import datetime
+from datetime import datetime, timedelta
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="H10 data analyzer")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--rr",     metavar="FILE")
-    group.add_argument("--ecg",    metavar="FILE")
-    group.add_argument("--acc",    metavar="FILE")
-    group.add_argument("--hr",     metavar="FILE")
-    parser.add_argument("--marker", metavar="FILE", help="Optional marker file")
-    return parser.parse_args()
+import neurokit2 as nk
+
+# ─────────────────────────────────────────────────────────────
+# Utils
+# ─────────────────────────────────────────────────────────────
+
+def log(msg):
+    print(msg, flush=True)
 
 def parse_ts(s):
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(s, fmt)
-        except ValueError:
+        except:
             pass
-    raise ValueError(f"Cannot parse: {s}")
+    raise ValueError(s)
 
-def read_csv(filepath, delimiter=";"):
+def read_csv(filepath):
     with open(filepath, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f, delimiter=delimiter)
-        lines = [r for r in reader if not (r and r[0].startswith("#"))]
-    print(f"  [read_csv] {filepath}")
-    print(f"  [read_csv] header : {lines[0]}")
-    print(f"  [read_csv] {len(lines)-1} data rows")
-    return lines[0], lines[1:]
+        r = csv.reader(f, delimiter=";")
+        rows = [x for x in r if not (x and x[0].startswith("#"))]
+    return rows[1:]
 
-def read_marker(filepath):
-    print(f"\n[marker] Reading {filepath}")
-    _, rows = read_csv(filepath)
-    start = stop = None
-    for row in rows:
-        if len(row) < 2:
+# ─────────────────────────────────────────────────────────────
+# FILE DISCOVERY
+# ─────────────────────────────────────────────────────────────
+
+def find_file(path, keyword):
+    files = glob.glob(os.path.join(path, f"*{keyword}*.txt"))
+    return files[0] if files else None
+
+# ─────────────────────────────────────────────────────────────
+# LOADERS
+# ─────────────────────────────────────────────────────────────
+
+def load_ecg(file):
+    log(f"[ecg] {file}")
+    rows = read_csv(file)
+    ts, ecg = [], []
+    for r in rows:
+        if len(r) < 4: continue
+        try:
+            ts.append(parse_ts(r[0]))
+            ecg.append(float(r[3]))
+        except:
             continue
-        ts    = parse_ts(row[0].strip())
-        label = row[1].strip()
-        if "START" in label:
-            start = ts
-            print(f"  [marker] START → {start}")
-        elif "STOP" in label:
-            stop = ts
-            print(f"  [marker] STOP  → {stop}")
+    return np.array(ts), np.array(ecg)
+
+def load_marker(file):
+    if not file:
+        log("[marker] none found")
+        return None, None
+
+    log(f"[marker] {file}")
+    rows = read_csv(file)
+
+    start = stop = None
+    for r in rows:
+        if len(r) < 2: continue
+        ts = parse_ts(r[0])
+        label = r[1].strip().upper()
+
+        if label == "MARKER_START": start = ts
+        if label == "MARKER_STOP":  stop  = ts
+
     if start and stop:
-        print(f"  [marker] Duration: {stop - start}")
+        log(f"[marker] window: {start} → {stop}")
+    else:
+        log("[marker] invalid or incomplete")
+
     return start, stop
 
-# ── RR pipeline ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# CORE
+# ─────────────────────────────────────────────────────────────
 
-def pipeline_rr(filepath, marker_file=None):
-    import neurokit2 as nk
+def plot_ecg_segment(ts_ecg, ecg, m_start, m_stop):
+    if not (m_start and m_stop):
+        log("[ecg] no marker → skip ECG segment")
+        return
 
-    print(f"\n[rr] Reading {filepath}")
-    header, rows = read_csv(filepath)
+    mid = m_start + (m_stop - m_start)/2
+    start = mid - timedelta(seconds=30)
+    end   = mid + timedelta(seconds=30)
 
-    timestamps, rr = [], []
-    skipped = 0
-    for row in rows:
-        if len(row) < 2:
-            skipped += 1
-            continue
-        try:
-            timestamps.append(parse_ts(row[0].strip()))
-            rr.append(float(row[1]))
-        except ValueError:
-            skipped += 1
+    log(f"[ecg] plotting 60s segment around {mid}")
 
-    print(f"  [rr] Parsed   : {len(rr)} beats")
-    print(f"  [rr] Skipped  : {skipped} rows")
-    if timestamps:
-        print(f"  [rr] Start    : {timestamps[0]}")
-        print(f"  [rr] End      : {timestamps[-1]}")
-        duration_s = sum(rr) / 1000.0
-        print(f"  [rr] Total RR duration : {duration_s/3600:.2f}h ({duration_s:.0f}s)")
-        print(f"  [rr] Mean HR  : {60000/np.mean(rr):.1f} bpm")
+    mask = (ts_ecg >= start) & (ts_ecg <= end)
 
-    timestamps = np.array(timestamps)
-    rr = np.array(rr)
+    if np.sum(mask) < 10:
+        log("[ecg] insufficient data for segment")
+        return
 
-    # ── HRV window ──
-    marker_start = marker_stop = None
-    if marker_file:
-        marker_start, marker_stop = read_marker(marker_file)
+    plt.figure(figsize=(12,4))
+    plt.plot(ts_ecg[mask], ecg[mask])
+    plt.title(f"ECG segment (centered) {mid.strftime('%H:%M:%S')}")
+    plt.xlabel("Time")
+    plt.ylabel("ECG")
+    plt.tight_layout()
+    plt.show()
 
-    if marker_start and marker_stop:
-        mask = (timestamps >= marker_start) & (timestamps <= marker_stop)
-        hrv_rr = rr[mask]
-        print(f"\n[rr] HRV window: marker ({marker_start} → {marker_stop})")
-        print(f"  [rr] Beats in window : {len(hrv_rr)}")
-    else:
-        hrv_rr, total = [], 0
-        for val in rr:
-            hrv_rr.append(val)
-            total += val
-            if total >= 300000:
-                break
-        hrv_rr = np.array(hrv_rr)
-        print(f"\n[rr] HRV window: first 5 min (no marker)")
-        print(f"  [rr] Beats in window : {len(hrv_rr)}")
+def compute_rr_from_ecg(ecg, sr):
+    log("[core] cleaning ECG")
+    ecg_clean = nk.ecg_clean(ecg, sampling_rate=sr)
 
-    rr_time   = np.cumsum(hrv_rr) / 1000.0
-    peaks_idx = np.round(rr_time * 1000).astype(int)
+    log("[core] detecting R peaks")
+    _, info = nk.ecg_peaks(ecg_clean, sampling_rate=sr, correct_artifacts=True)
 
-    print(f"\n[rr] Running nk.hrv()…")
-    hrv = nk.hrv(peaks_idx, sampling_rate=1000, show=True)
-    print("\n=== HRV RESULTS ===")
-    print(hrv.T.to_string())
+    peaks = info["ECG_R_Peaks"]
+    rr = np.diff(peaks) / sr * 1000
 
-    # ── Night overview ──
-    print(f"\n[rr] Building night overview (5-min window, 1-min step)…")
-    window_ms  = 300_000
-    step_ms    =  60_000
-    cumsum_rr  = np.cumsum(rr)
+    log(f"[core] peaks: {len(peaks)}")
+    log(f"[core] rr intervals: {len(rr)}")
 
-    win_times, win_rmssd, win_hr = [], [], []
+    return peaks, rr
+
+def sliding_hrv(timestamps, rr, window_min):
+    window = timedelta(minutes=window_min)
+    step   = timedelta(minutes=1)
+
+    times, rmssd, hr = [], [], []
+
     pos = 0
+    while pos < len(timestamps):
+        start = timestamps[pos]
+        end   = start + window
 
-    while pos < len(rr):
-        start_ms = cumsum_rr[pos] - rr[pos]
-        end_ms   = start_ms + window_ms
-        idx = np.where((cumsum_rr >= start_ms) & (cumsum_rr <= end_ms))[0]
-        if len(idx) < 10:
-            print(f"  [rr] Stopping at pos={pos} (only {len(idx)} beats in window)")
+        idx = np.where((timestamps >= start) & (timestamps <= end))[0]
+        if len(idx) < 20:
             break
+
         w = rr[idx]
-        win_rmssd.append(np.sqrt(np.mean(np.diff(w)**2)))
-        win_hr.append(60000.0 / np.mean(w))
-        win_times.append(timestamps[idx[0]])
-        target = start_ms + step_ms
-        while pos < len(rr) and cumsum_rr[pos] < target:
+
+        diff = np.diff(w)
+        rmssd.append(np.sqrt(np.mean(diff**2)))
+        hr.append(60000 / np.mean(w))
+        times.append(start)
+
+        target = start + step
+        while pos < len(timestamps) and timestamps[pos] < target:
             pos += 1
 
-    print(f"  [rr] Windows computed : {len(win_times)}")
-    if win_times:
-        print(f"  [rr] Overview start   : {win_times[0]}")
-        print(f"  [rr] Overview end     : {win_times[-1]}")
+    return times, rmssd, hr
 
+# ─────────────────────────────────────────────────────────────
+
+def run(path, window_min, use_marker, use_full):
+
+    log("[init] discovering files")
+
+    ecg_file = find_file(path, "ECG")
+    marker_file = find_file(path, "MARKER")
+
+    ts_ecg, ecg = load_ecg(ecg_file)
+
+    if use_marker:
+        log("[mode] marker ENABLED (default)")
+        m_start, m_stop = load_marker(marker_file)
+    else:
+        log("[mode] marker DISABLED (--no-marker)")
+        m_start, m_stop = None, None
+
+    SR = 130
+
+    peaks, rr = compute_rr_from_ecg(ecg, SR)
+    rr_ts = ts_ecg[peaks][1:]
+
+    # ── sliding HRV
+    times, rmssd, hr = sliding_hrv(rr_ts, rr, window_min)
+    log(f"[core] windows: {len(times)}")
+
+    # ── correlation
+    if len(hr) > 10:
+        corr = np.corrcoef(hr, rmssd)[0,1]
+        log(f"[core] HR vs RMSSD corr: {corr:.2f}")
+
+    # ─────────────────────────
+    # FULL NIGHT FAST
+    # ─────────────────────────
+    diff = np.diff(rr)
+    rmssd_full = np.sqrt(np.mean(diff**2))
+    sdnn_full  = np.std(rr)
+    hr_full    = 60000 / np.mean(rr)
+
+    log("[core] FULL NIGHT:")
+    log(f"  RMSSD: {rmssd_full:.1f} ms")
+    log(f"  SDNN : {sdnn_full:.1f} ms")
+    log(f"  HR   : {hr_full:.1f} bpm")
+
+    # ─────────────────────────
+    # GRAPH OVERVIEW (FIXED)
+    # ─────────────────────────
     fig, ax1 = plt.subplots(figsize=(14, 5))
-    fig.suptitle("Night overview — sliding 5-min window, 1-min step")
-    ax1.set_xlabel("Time")
-    ax1.set_ylabel("RMSSD (ms)", color="tab:blue")
-    ax1.plot(win_times, win_rmssd, color="tab:blue", linewidth=1.2, label="RMSSD")
-    ax1.tick_params(axis="y", labelcolor="tab:blue")
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
-    if marker_start:
-        ax1.axvline(marker_start, color="green", linestyle="--", linewidth=1, label="Marker start")
-    if marker_stop:
-        ax1.axvline(marker_stop,  color="green", linestyle=":",  linewidth=1, label="Marker stop")
+    ax1.plot(times, rmssd, label="RMSSD (ms)", color="tab:blue")
+    ax1.set_ylabel("RMSSD (ms)")
 
     ax2 = ax1.twinx()
-    ax2.set_ylabel("HR (bpm)", color="tab:red")
-    ax2.plot(win_times, win_hr, color="tab:red", linewidth=1.2, alpha=0.7, label="HR")
-    ax2.tick_params(axis="y", labelcolor="tab:red")
+    ax2.plot(times, hr, linestyle="--", label="HR (bpm)", color="tab:red")
+    ax2.set_ylabel("HR (bpm)")
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
-    fig.autofmt_xdate()
+    # marker overlay VISUEL uniquement
+    if m_start:
+        ax1.axvline(m_start, linestyle="--", color="green", label="Marker START")
+    if m_stop:
+        ax1.axvline(m_stop, linestyle="--", color="orange", label="Marker STOP")
+
+    # fusion légendes
+    lines = ax1.get_lines() + ax2.get_lines()
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels)
+
+    title = "Sleep overview (FULL NIGHT)"
+    if m_start and m_stop:
+        title += f"\nMarker: {m_start.strftime('%H:%M')} → {m_stop.strftime('%H:%M')}"
+
+    plt.title(title)
     plt.tight_layout()
     plt.show()
 
-# ── ECG pipeline ─────────────────────────────────────────────────────────────
+    log("\n[graph] Sleep overview:")
+    log("  RMSSD ↑ = récupération parasympathique")
+    log("  HR ↓ = repos profond")
+    log("  HR↑ + RMSSD↓ = stress / activation")
 
-def pipeline_ecg(filepath, marker_file=None):
-    import neurokit2 as nk
+    # ECG
+    plot_ecg_segment(ts_ecg, ecg, m_start, m_stop)
 
-    SAMPLING_RATE = 130
+    # ───────────────────────
+    # POINCARÉ + INTERPRÉTATION
+    # ─────────────────────────
+    log("[core] Poincaré plot")
 
-    print(f"\n[ecg] Reading {filepath}")
-    header, rows = read_csv(filepath)
+    rr1 = rr[:-1]
+    rr2 = rr[1:]
 
-    timestamps, ecg = [], []
-    skipped = 0
-    for row in rows:
-        if len(row) < 4:
-            skipped += 1
-            continue
-        try:
-            timestamps.append(parse_ts(row[0].strip()))
-            ecg.append(float(row[3]))
-        except ValueError:
-            skipped += 1
+    plt.figure(figsize=(5,5))
+    plt.scatter(rr1, rr2, s=2)
+    plt.xlabel("RR(n)")
+    plt.ylabel("RR(n+1)")
+    plt.title("Poincaré plot")
+    plt.tight_layout()
+    plt.show()
 
-    ecg        = np.array(ecg, dtype=float)
-    timestamps = np.array(timestamps)
+    # interprétation simple
+    sd1 = np.std((rr2 - rr1) / np.sqrt(2))
+    sd2 = np.std((rr2 + rr1) / np.sqrt(2))
 
-    print(f"  [ecg] Parsed   : {len(ecg):,} samples")
-    print(f"  [ecg] Skipped  : {skipped} rows")
-    if len(timestamps):
-        print(f"  [ecg] Start    : {timestamps[0]}")
-        print(f"  [ecg] End      : {timestamps[-1]}")
-        print(f"  [ecg] Duration : {len(ecg)/SAMPLING_RATE/3600:.2f}h")
-    print(f"  [ecg] Signal range : {ecg.min():.0f} → {ecg.max():.0f} µV")
+    log("\n[interpretation] Poincaré (TES DONNÉES):")
+    log(f"  SD1 (court terme): {sd1:.1f}")
+    log(f"  SD2 (long terme): {sd2:.1f}")
 
-    # ── Window ──
-    marker_start = marker_stop = None
-    if marker_file:
-        marker_start, marker_stop = read_marker(marker_file)
+    ratio = sd1 / sd2 if sd2 > 0 else 0
+    log(f"  ratio SD1/SD2: {ratio:.2f}")
 
-    if marker_start and marker_stop:
-        mask = (timestamps >= marker_start) & (timestamps <= marker_stop)
-        plot_ecg = ecg[mask]
-        plot_ts  = timestamps[mask]
-        title_suffix = f"marker window ({marker_start.strftime('%H:%M')} → {marker_stop.strftime('%H:%M')})"
-        print(f"\n[ecg] Using marker window: {len(plot_ecg):,} samples ({len(plot_ecg)/SAMPLING_RATE:.1f}s)")
+    if ratio > 0.5:
+        log("  → variabilité court terme élevée (bonne récupération)")
+    elif ratio > 0.3:
+        log("  → variabilité modérée")
     else:
-        n = SAMPLING_RATE * 30
-        plot_ecg = ecg[:n]
-        plot_ts  = timestamps[:n]
-        title_suffix = "first 30 seconds"
-        print(f"\n[ecg] No marker — using first 30s ({n} samples)")
+        log("  → variabilité faible (activation / fatigue possible)")
 
-    # skip startup artifact
-    skip = SAMPLING_RATE * 2
-    plot_ecg = plot_ecg[skip:]
-    plot_ts  = plot_ts[skip:]
-    print(f"  [ecg] After skipping 2s artifact : {len(plot_ecg):,} samples")
-    print(f"  [ecg] Signal range after skip    : {plot_ecg.min():.0f} → {plot_ecg.max():.0f} µV")
+    log("\n[lecture générale]:")
+    log("  SD1 = variabilité battement à battement")
+    log("  SD2 = tendance globale / régulation lente")
+    log("  nuage large = variabilité élevée")
+    log("  nuage serré = rigidité cardiaque")
 
-    print(f"  [ecg] Cleaning signal…")
-    ecg_cleaned = nk.ecg_clean(plot_ecg, sampling_rate=SAMPLING_RATE)
-    print(f"  [ecg] Detecting R-peaks…")
-    peaks, info = nk.ecg_peaks(ecg_cleaned, sampling_rate=SAMPLING_RATE)
-    r_peaks = info["ECG_R_Peaks"]
-    print(f"  [ecg] R-peaks detected : {len(r_peaks):,}")
-    if len(r_peaks) > 1:
-        mean_rr = np.mean(np.diff(r_peaks)) / SAMPLING_RATE * 1000
-        print(f"  [ecg] Mean RR from peaks : {mean_rr:.0f} ms ({60000/mean_rr:.1f} bpm)")
+    # ─────────────────────────
+    # NEUROKIT (OPTIONNEL)
+    # ─────────────────────────
+    if use_full:
+        log("[core] neurokit FULL mode (marker-limited)")
 
-    t = np.arange(len(plot_ecg)) / SAMPLING_RATE
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.set_title(f"ECG — {title_suffix} with R-peaks")
-    ax.plot(t, ecg_cleaned, linewidth=0.6, color="tab:blue", label="ECG")
-    ax.scatter(r_peaks / SAMPLING_RATE, ecg_cleaned[r_peaks],
-               color="red", zorder=5, s=20, label="R-peaks")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude (µV)")
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
+        if m_start and m_stop:
+            mask = (rr_ts >= m_start) & (rr_ts <= m_stop)
+            rr_nk = rr[mask]
+        else:
+            log("[core] no valid marker → using full RR (slow)")
+            rr_nk = rr
 
-# ── ACC pipeline ─────────────────────────────────────────────────────────────
+        peaks_idx = np.round(np.cumsum(rr_nk)).astype(int)
+        nk.hrv(peaks_idx, sampling_rate=1000, show=True)
 
-def pipeline_acc(filepath):
-    print(f"\n[acc] Reading {filepath}")
-    header, rows = read_csv(filepath)
-
-    timestamps, X, Y, Z = [], [], [], []
-    skipped = 0
-    for row in rows:
-        if len(row) < 5:
-            skipped += 1
-            continue
-        try:
-            timestamps.append(parse_ts(row[0].strip()))
-            X.append(float(row[2]))
-            Y.append(float(row[3]))
-            Z.append(float(row[4]))
-        except ValueError:
-            skipped += 1
-
-    print(f"  [acc] Parsed   : {len(timestamps):,} samples")
-    print(f"  [acc] Skipped  : {skipped} rows")
-    if timestamps:
-        print(f"  [acc] Start    : {timestamps[0]}")
-        print(f"  [acc] End      : {timestamps[-1]}")
-        print(f"  [acc] X range  : {min(X):.0f} → {max(X):.0f} mg")
-        print(f"  [acc] Y range  : {min(Y):.0f} → {max(Y):.0f} mg")
-        print(f"  [acc] Z range  : {min(Z):.0f} → {max(Z):.0f} mg")
-
-    step = 50
-    print(f"  [acc] Downsampling x{step} for plot ({len(timestamps)//step:,} points)")
-    ts = timestamps[::step]
-    Xd = np.array(X[::step])
-    Yd = np.array(Y[::step])
-    Zd = np.array(Z[::step])
-
-    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
-    fig.suptitle("Accelerometer — night (downsampled)")
-    for ax, data, label, color in zip(
-        axes,
-        [Xd, Yd, Zd],
-        ["X [mg]", "Y [mg]", "Z [mg]"],
-        ["tab:blue", "tab:orange", "tab:green"]
-    ):
-        ax.plot(ts, data, linewidth=0.5, color=color)
-        ax.set_ylabel(label)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-
-    axes[-1].set_xlabel("Time")
-    fig.autofmt_xdate()
-    plt.tight_layout()
-    plt.show()
-
-# ── HR pipeline ──────────────────────────────────────────────────────────────
-
-def pipeline_hr(filepath, marker_file=None):
-    print(f"\n[hr] Reading {filepath}")
-    header, rows = read_csv(filepath)
-
-    timestamps, hr = [], []
-    skipped = 0
-    for row in rows:
-        if len(row) < 2:
-            skipped += 1
-            continue
-        try:
-            timestamps.append(parse_ts(row[0].strip()))
-            hr.append(float(row[1]))
-        except ValueError:
-            skipped += 1
-
-    print(f"  [hr] Parsed   : {len(hr):,} samples")
-    print(f"  [hr] Skipped  : {skipped} rows")
-    if timestamps:
-        print(f"  [hr] Start    : {timestamps[0]}")
-        print(f"  [hr] End      : {timestamps[-1]}")
-        print(f"  [hr] HR range : {min(hr):.0f} → {max(hr):.0f} bpm")
-        print(f"  [hr] Mean HR  : {np.mean(hr):.1f} bpm")
-
-    marker_start = marker_stop = None
-    if marker_file:
-        marker_start, marker_stop = read_marker(marker_file)
-
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.set_title("Heart Rate — night")
-    ax.plot(timestamps, hr, linewidth=0.8, color="tab:red")
-    ax.set_ylabel("HR (bpm)")
-    ax.set_xlabel("Time")
-    if marker_start:
-        ax.axvline(marker_start, color="green", linestyle="--", linewidth=1, label="Marker start")
-    if marker_stop:
-        ax.axvline(marker_stop,  color="green", linestyle=":",  linewidth=1, label="Marker stop")
-    ax.legend()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    fig.autofmt_xdate()
-    plt.tight_layout()
-    plt.show()
-
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
-    m = args.marker
-    if args.rr:
-        pipeline_rr(args.rr, m)
-    elif args.ecg:
-        pipeline_ecg(args.ecg, m)
-    elif args.acc:
-        pipeline_acc(args.acc)
-    elif args.hr:
-        pipeline_hr(args.hr, m)
+    description = """
+Sleep HRV analysis (Garmin ECG export)
+
+Definitions:
+- RR interval: time between heart beats (ms)
+- HRV: variability of RR intervals
+- RMSSD: short-term HRV (parasympathetic activity)
+- SDNN: global HRV variability
+
+Useful reading:
+- https://en.wikipedia.org/wiki/Heart_rate_variability
+- https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5624990/
+"""
+
+    p = argparse.ArgumentParser(description=description)
+
+    p.add_argument("--path", required=True, help="Folder containing ECG/ACC/MARKER files")
+    p.add_argument("--window", type=int, default=5, help="Sliding window (minutes)")
+
+    p.add_argument("--no-marker", action="store_true",
+                   help="Ignore marker file → analyze full recording")
+
+    p.add_argument("--full", action="store_true",
+                   help="Run NeuroKit full HRV analysis (slow)")
+
+    args = p.parse_args()
+
+    run(
+        args.path,
+        args.window,
+        use_marker=not args.no_marker,
+        use_full=args.full
+    )
 
 if __name__ == "__main__":
     main()
