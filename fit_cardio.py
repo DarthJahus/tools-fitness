@@ -438,7 +438,7 @@ def plot_heart_rate(df, zones, peaks, lap_times_s=None):
             ax.text(
                 t / 60,
                 0.01,  # 1 % au-dessus de l'axe X
-                f"    L{i + 1}",
+                f"    L{i}",
                 transform=ax.get_xaxis_transform(),
                 ha="left",
                 va="bottom",
