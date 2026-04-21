@@ -17,12 +17,12 @@ def log(msg):
     print(msg, flush=True)
 
 def parse_ts(s):
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
         try:
             return datetime.strptime(s, fmt)
         except:
             pass
-    raise ValueError(s)
+    raise ValueError(f"Cannot parse timestamp: {s!r}")
 
 def read_csv(filepath):
     with open(filepath, newline="", encoding="utf-8") as f:
@@ -83,30 +83,47 @@ def load_marker(file):
 # CORE
 # ─────────────────────────────────────────────────────────────
 
-def plot_ecg_segment(ts_ecg, ecg, m_start, m_stop):
-    if not (m_start and m_stop):
-        log("[ecg] no marker → skip ECG segment")
-        return
+def find_gaps(rr_ts, threshold_s=30):
+    """Return list of (gap_start, gap_end, duration_s) for gaps > threshold_s."""
+    timestamps = [t.timestamp() for t in rr_ts]
+    diffs = np.diff(timestamps)
+    gap_idx = np.where(diffs > threshold_s)[0]
+    return [(rr_ts[i], rr_ts[i + 1], diffs[i]) for i in gap_idx]
 
-    mid = m_start + (m_stop - m_start)/2
-    start = mid - timedelta(seconds=30)
-    end   = mid + timedelta(seconds=30)
 
-    log(f"[ecg] plotting 60s segment around {mid}")
+def resolve_marker_rr(rr, rr_ts, m_start, m_stop):
+    """
+    Return the RR slice matching the marker window, or None if the window
+    falls in a recording gap. Logs a clear diagnostic in that case.
+    """
+    mask = np.array([(t >= m_start) and (t <= m_stop) for t in rr_ts])
+    rr_nk = rr[mask]
 
-    mask = (ts_ecg >= start) & (ts_ecg <= end)
+    if len(rr_nk) > 0:
+        return rr_nk
 
-    if np.sum(mask) < 10:
-        log("[ecg] insufficient data for segment")
-        return
+    # Zero matches — figure out why
+    log(f"[marker] WARNING: window [{m_start} → {m_stop}] matches 0 RR intervals")
+    log(f"[marker]   recording range: {rr_ts[0]} → {rr_ts[-1]}")
 
-    plt.figure(figsize=(12,4))
-    plt.plot(ts_ecg[mask], ecg[mask])
-    plt.title(f"ECG segment (centered) {mid.strftime('%H:%M:%S')}")
-    plt.xlabel("Time")
-    plt.ylabel("ECG")
-    plt.tight_layout()
-    plt.show()
+    gaps = find_gaps(rr_ts)
+    covering_gap = None
+    for g_start, g_end, g_dur in gaps:
+        if g_start <= m_start and g_end >= m_stop:
+            covering_gap = (g_start, g_end, g_dur)
+            break
+
+    if covering_gap:
+        g_start, g_end, g_dur = covering_gap
+        log(f"[marker]   → marker falls inside a recording gap of {g_dur:.0f}s")
+        log(f"[marker]     gap: {g_start} → {g_end}")
+        log("[marker]   no data available for this window — skipping nk.hrv")
+        return None
+    else:
+        log("[marker]   → cause unknown (marker outside recording range?)")
+        log("[marker]   falling back to full RR")
+        return rr
+
 
 def compute_rr_from_ecg(ecg, sr):
     log("[core] cleaning ECG")
@@ -122,6 +139,7 @@ def compute_rr_from_ecg(ecg, sr):
     log(f"[core] rr intervals: {len(rr)}")
 
     return peaks, rr
+
 
 def sliding_hrv(timestamps, rr, window_min):
     window = timedelta(minutes=window_min)
@@ -151,18 +169,67 @@ def sliding_hrv(timestamps, rr, window_min):
 
     return times, rmssd, hr
 
+
+def plot_ecg_segment(ts_ecg, ecg, m_start, m_stop):
+    if not (m_start and m_stop):
+        log("[ecg] no marker → skip ECG segment")
+        return
+
+    mid   = m_start + (m_stop - m_start) / 2
+    start = mid - timedelta(seconds=30)
+    end   = mid + timedelta(seconds=30)
+
+    log(f"[ecg] plotting 60s segment around {mid}")
+
+    mask = (ts_ecg >= start) & (ts_ecg <= end)
+    if np.sum(mask) < 10:
+        log("[ecg] insufficient data for segment")
+        return
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(ts_ecg[mask], ecg[mask])
+    plt.title(f"ECG segment (centered) {mid.strftime('%H:%M:%S')}")
+    plt.xlabel("Time")
+    plt.ylabel("ECG")
+    plt.tight_layout()
+    plt.show()
+
+
+def run_neurokit(rr, rr_ts, m_start, m_stop):
+    log("[nk] neurokit FULL mode")
+
+    if m_start and m_stop:
+        rr_nk = resolve_marker_rr(rr, rr_ts, m_start, m_stop)
+        if rr_nk is None:
+            return  # gap — already logged, nothing to do
+    else:
+        log("[nk] no marker → using full RR (slow)")
+        rr_nk = rr
+
+    log(f"[nk] running on {len(rr_nk)} RR intervals")
+    peaks_idx = np.concatenate([[0], np.round(np.cumsum(rr_nk)).astype(int)])
+    nk.hrv(peaks_idx, sampling_rate=1000, show=True)
+    plt.tight_layout()
+    plt.show()
+
+
+# ─────────────────────────────────────────────────────────────
+# RUN
 # ─────────────────────────────────────────────────────────────
 
-def run(path, window_min, use_marker, use_full, no_gru):
+def run(path, window_min, use_marker, use_full, no_gru, custom_marker=None):
 
     log("[init] discovering files")
-
-    ecg_file = find_file(path, "ECG")
+    ecg_file    = find_file(path, "ECG")
     marker_file = find_file(path, "MARKER")
 
     ts_ecg, ecg = load_ecg(ecg_file)
 
-    if use_marker:
+    # ── marker resolution
+    if custom_marker:
+        m_start, m_stop = custom_marker
+        log(f"[mode] custom marker: {m_start} → {m_stop}")
+    elif use_marker:
         log("[mode] marker ENABLED (default)")
         m_start, m_stop = load_marker(marker_file)
     else:
@@ -178,15 +245,12 @@ def run(path, window_min, use_marker, use_full, no_gru):
     times, rmssd, hr = sliding_hrv(rr_ts, rr, window_min)
     log(f"[core] windows: {len(times)}")
 
-    # ── correlation
     if len(hr) > 10:
-        corr = np.corrcoef(hr, rmssd)[0,1]
+        corr = np.corrcoef(hr, rmssd)[0, 1]
         log(f"[core] HR vs RMSSD corr: {corr:.2f}")
 
-    # ─────────────────────────
-    # FULL NIGHT FAST
-    # ─────────────────────────
-    diff = np.diff(rr)
+    # ── full night stats
+    diff       = np.diff(rr)
     rmssd_full = np.sqrt(np.mean(diff**2))
     sdnn_full  = np.std(rr)
     hr_full    = 60000 / np.mean(rr)
@@ -196,18 +260,15 @@ def run(path, window_min, use_marker, use_full, no_gru):
     log(f"  SDNN : {sdnn_full:.1f} ms")
     log(f"  HR   : {hr_full:.1f} bpm")
 
-    # ECG
+    # ── ECG segment plot
     plot_ecg_segment(ts_ecg, ecg, m_start, m_stop)
 
-    # ───────────────────────
-    # POINCARÉ + INTERPRÉTATION
-    # ─────────────────────────
+    # ── Poincaré
     log("[core] Poincaré plot")
-
     rr1 = rr[:-1]
     rr2 = rr[1:]
 
-    plt.figure(figsize=(5,5))
+    plt.figure(figsize=(5, 5))
     plt.scatter(rr1, rr2, s=2)
     plt.xlabel("RR(n)")
     plt.ylabel("RR(n+1)")
@@ -215,16 +276,14 @@ def run(path, window_min, use_marker, use_full, no_gru):
     plt.tight_layout()
     plt.show()
 
-    # interprétation simple
-    sd1 = np.std((rr2 - rr1) / np.sqrt(2))
-    sd2 = np.std((rr2 + rr1) / np.sqrt(2))
-
-    log("\n[interpretation] Poincaré (TES DONNÉES):")
-    log(f"  SD1 (court terme): {sd1:.1f}")
-    log(f"  SD2 (long terme): {sd2:.1f}")
-
+    sd1   = np.std((rr2 - rr1) / np.sqrt(2))
+    sd2   = np.std((rr2 + rr1) / np.sqrt(2))
     ratio = sd1 / sd2 if sd2 > 0 else 0
-    log(f"  ratio SD1/SD2: {ratio:.2f}")
+
+    log("\n[interpretation] Poincaré:")
+    log(f"  SD1 (court terme): {sd1:.1f}")
+    log(f"  SD2 (long terme):  {sd2:.1f}")
+    log(f"  ratio SD1/SD2:     {ratio:.2f}")
 
     if ratio > 0.5:
         log("  → variabilité court terme élevée (bonne récupération)")
@@ -239,33 +298,15 @@ def run(path, window_min, use_marker, use_full, no_gru):
     log("  nuage large = variabilité élevée")
     log("  nuage serré = rigidité cardiaque")
 
-    # ─────────────────────────
-    # SLEEP STAGING
-    # ─────────────────────────
+    # ── sleep staging
     if no_gru:
         sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr)
     else:
         sleep_staging(ecg, SR, ts_ecg, times, rmssd, hr)
 
-    # ─────────────────────────
-    # NEUROKIT (OPTIONNEL)
-    # ─────────────────────────
+    # ── neurokit full (optional)
     if use_full:
-        log("[core] neurokit FULL mode (marker-limited)")
-
-        if m_start and m_stop:
-            mask = (rr_ts >= m_start) & (rr_ts <= m_stop)
-            rr_nk = rr[mask]
-        else:
-            log("[core] no valid marker → using full RR (slow)")
-            rr_nk = rr
-
-        log(f"[core] nk.hrv on {len(rr_nk)} beats")
-        # cumsum en ms → indices à 1000 Hz
-        peaks_idx = np.concatenate([[0], np.round(np.cumsum(rr_nk)).astype(int)])
-        nk.hrv(peaks_idx, sampling_rate=1000, show=True)
-        plt.tight_layout()
-        plt.show()
+        run_neurokit(rr, rr_ts, m_start, m_stop)
 
 # ─────────────────────────────────────────────────────────────
 
@@ -289,7 +330,7 @@ def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr):
         if len(w) < 5:
             t += epoch_td
             continue
-        diff  = np.diff(w)
+        diff    = np.diff(w)
         rmssd_e = np.sqrt(np.mean(diff**2)) if len(diff) > 0 else 0
         hr_e    = 60000 / np.mean(w)
         if hr_e > 65 and rmssd_e < 25:
@@ -334,10 +375,10 @@ def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr):
     fig.suptitle("Sleep overview — RMSSD/HR + hypnogram (rule-based)")
 
     for i in range(len(times) - 1):
-        t0, t1  = times[i], times[i+1]
-        stage   = get_stage_for_time(t0)
-        color   = stage_colors.get(stage, "#888888")
-        ax1.fill_betweenx([0, max(rmssd)*1.1], t0, t1, color=color, alpha=0.15)
+        t0, t1 = times[i], times[i + 1]
+        stage  = get_stage_for_time(t0)
+        color  = stage_colors.get(stage, "#888888")
+        ax1.fill_betweenx([0, max(rmssd) * 1.1], t0, t1, color=color, alpha=0.15)
 
     ax1.plot(times, rmssd, color="tab:blue", linewidth=1.2, label="RMSSD (ms)", zorder=3)
     ax1b = ax1.twinx()
@@ -354,8 +395,8 @@ def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr):
     y_vals  = [stage_y[l] for l in labels]
 
     ax2.step(epochs_ts, y_vals, where="post", color="tab:blue", linewidth=0.8)
-    ax2.set_yticks([0,1,2,3,4])
-    ax2.set_yticklabels(["N3","N2","N1","REM","WAKE"])
+    ax2.set_yticks([0, 1, 2, 3, 4])
+    ax2.set_yticklabels(["N3", "N2", "N1", "REM", "WAKE"])
     ax2.set_ylabel("Stage")
     ax2.set_xlabel("Time")
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -367,7 +408,8 @@ def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr):
 
 def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
     import sleepecg
-    import os, logging, warnings
+    import logging
+    import warnings
 
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -379,10 +421,9 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
 
     beat_times = beats / sr
 
-    # datetime complet requis
     record = sleepecg.SleepRecord(
         sleep_stage_duration=30,
-        recording_start_time=ts_ecg[0],  # datetime complet
+        recording_start_time=ts_ecg[0],
         heartbeat_times=beat_times,
     )
 
@@ -395,16 +436,13 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
         warnings.simplefilter("ignore")
         stages_pred = sleepecg.stage(clf, record, return_mode="int")
 
-    # stages_mode est une string ex: "wake-rem-nrem" ou "wake-sleep"
-    log(f"[sleep] stages_mode raw: {clf.stages_mode}")
-
     STAGE_MAPS = {
-        "wake-rem-nrem": {0: "WAKE", 1: "REM", 2: "NREM"},
-        "wake-sleep": {0: "WAKE", 1: "SLEEP"},
-        "wake-rem-light-deep": {0: "WAKE", 1: "REM", 2: "LIGHT", 3: "DEEP"},
+        "wake-rem-nrem":      {0: "WAKE", 1: "REM", 2: "NREM"},
+        "wake-sleep":         {0: "WAKE", 1: "SLEEP"},
+        "wake-rem-light-deep":{0: "WAKE", 1: "REM", 2: "LIGHT", 3: "DEEP"},
     }
 
-    stage_map = STAGE_MAPS.get(clf.stages_mode, None)
+    stage_map = STAGE_MAPS.get(clf.stages_mode)
     if stage_map is None:
         log(f"[sleep] unknown stages_mode '{clf.stages_mode}', using raw indices")
         stage_map = {i: str(i) for i in range(10)}
@@ -412,30 +450,27 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
     stage_labels = list(stage_map.values())
     log(f"[sleep] stages mapped: {stage_labels}")
 
-    # Stats
     from collections import Counter
     labels_str = [stage_map.get(int(s), "?") for s in stages_pred]
     counts = Counter(labels_str)
-    total = len(labels_str)
+    total  = len(labels_str)
     log(f"\n[sleep] {total} epochs × 30s = {total * 30 / 3600:.1f}h")
     for label in stage_labels:
         count = counts.get(label, 0)
         log(f"  {label:6s}: {count:4d} = {count * 30 / 60:5.1f} min ({count / total * 100:.1f}%)")
 
-    # Timestamps des epochs
-    epoch_times = [ts_ecg[0] + timedelta(seconds=i*30) for i in range(len(stages_pred))]
+    epoch_times = [ts_ecg[0] + timedelta(seconds=i * 30) for i in range(len(stages_pred))]
 
-    # Colorisation du graphique nuit
     stage_colors = {
-        "WAKE": "#e74c3c",  # rouge
-        "REM": "#9b59b6",  # violet
-        "NREM": "#2980b9",  # bleu
-        "LIGHT": "#3498db",  # bleu clair
-        "DEEP": "#1a5276",  # bleu foncé
-        "SLEEP": "#27ae60",  # vert
-        "N1": "#5dade2",
-        "N2": "#2ecc71",
-        "N3": "#1a5276",
+        "WAKE":  "#e74c3c",
+        "REM":   "#9b59b6",
+        "NREM":  "#2980b9",
+        "LIGHT": "#3498db",
+        "DEEP":  "#1a5276",
+        "SLEEP": "#27ae60",
+        "N1":    "#5dade2",
+        "N2":    "#2ecc71",
+        "N3":    "#1a5276",
     }
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
@@ -450,8 +485,8 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
 
     for i in range(len(times) - 1):
         t0, t1 = times[i], times[i + 1]
-        stage = get_stage_for_time(t0)
-        color = stage_colors.get(stage, "#aaaaaa")
+        stage  = get_stage_for_time(t0)
+        color  = stage_colors.get(stage, "#aaaaaa")
         ax1.fill_betweenx([0, max(rmssd) * 1.1], t0, t1, color=color, alpha=0.2)
 
     ax1.plot(times, rmssd, color="white", linewidth=1.2, label="RMSSD (ms)", zorder=3)
@@ -467,7 +502,7 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr):
                loc="upper right", fontsize=8)
 
     stage_y = {l: i for i, l in enumerate(reversed(stage_labels))}
-    y_vals = [stage_y.get(l, 0) for l in labels_str]
+    y_vals  = [stage_y.get(l, 0) for l in labels_str]
 
     ax2.step(epoch_times, y_vals, where="post", color="#3498db", linewidth=0.8)
     ax2.set_yticks(list(stage_y.values()))
@@ -497,24 +532,34 @@ Useful reading:
 
     p = argparse.ArgumentParser(description=description)
 
-    p.add_argument("--path", required=True, help="Folder containing ECG/ACC/MARKER files")
-    p.add_argument("--window", type=int, default=5, help="Sliding window (minutes)")
-
-    p.add_argument("--no-marker", action="store_true",
-                   help="Ignore marker file → analyze full recording")
-
-    p.add_argument("--no-gru", action="store_true", help="Use rule-based hypnogram, without TensorFlow/GRU")
-    p.add_argument("--full", action="store_true",
-                   help="Run NeuroKit full HRV analysis (slow)")
+    p.add_argument("--path",    required=True, help="Folder containing ECG/ACC/MARKER files")
+    p.add_argument("--window",  type=int, default=5, help="Sliding window (minutes)")
+    p.add_argument("--no-marker",   action="store_true", help="Ignore marker file → analyze full recording")
+    p.add_argument("--no-gru",      action="store_true", help="Use rule-based hypnogram, without TensorFlow/GRU")
+    p.add_argument("--full",        action="store_true", help="Run NeuroKit full HRV analysis (slow)")
+    p.add_argument(
+        "--custom-marker",
+        nargs=2,
+        metavar=("START", "STOP"),
+        help="Manual marker window, e.g. --custom-marker 2026-04-15T08:30:00 2026-04-15T08:34:00"
+    )
 
     args = p.parse_args()
+
+    custom_marker = None
+    if args.custom_marker:
+        try:
+            custom_marker = (parse_ts(args.custom_marker[0]), parse_ts(args.custom_marker[1]))
+        except ValueError as e:
+            p.error(f"--custom-marker: {e}")
 
     run(
         args.path,
         args.window,
         use_marker=not args.no_marker,
         use_full=args.full,
-        no_gru=args.no_gru
+        no_gru=args.no_gru,
+        custom_marker=custom_marker,
     )
 
 if __name__ == "__main__":
