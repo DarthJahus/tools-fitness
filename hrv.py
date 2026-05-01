@@ -141,6 +141,145 @@ def compute_rr_from_ecg(ecg, sr):
     return peaks, rr
 
 
+def detect_ectopics(ecg, peaks, rr, rr_ts, sr, window_beats=30, premature_ratio=0.80):
+    """
+    Détection des extrasystoles depuis les intervalles RR.
+    Classification SVEB/VEB par critère de pause compensatoire.
+    Détection des couplets/triplets/runs.
+    """
+    n = len(rr)
+    if n < window_beats * 2:
+        log("[ectopic] pas assez d'intervalles RR")
+        return None
+
+    # Médiane locale glissante (suit la dérive nocturne de la FC)
+    half_w = window_beats // 2
+    local_median = np.array([
+        np.median(rr[max(0, i - half_w):min(n, i + half_w)])
+        for i in range(n)
+    ])
+
+    # Détection : RR court = battement prématuré
+    ectopic_mask = np.zeros(n, dtype=bool)
+    for i in range(1, n - 1):
+        if rr[i] < premature_ratio * local_median[i]:
+            ectopic_mask[i] = True
+
+    ectopic_indices = np.where(ectopic_mask)[0]
+
+    if len(ectopic_indices) == 0:
+        log("[ectopic] aucune extrasystole détectée")
+        return {"count": 0, "sveb": 0, "veb": 0,
+                "couplets": 0, "triplets": 0, "runs": 0,
+                "indices": [], "types": [], "timestamps": []}
+
+    # Classification SVEB / VEB par pause compensatoire
+    types = []
+    for i in ectopic_indices:
+        if i + 1 < n:
+            compensatory_sum = rr[i] + rr[i + 1]
+            if compensatory_sum >= 1.8 * local_median[i]:
+                types.append("VEB")   # pause complète → ventriculaire
+            else:
+                types.append("SVEB")  # pause incomplète → supraventriculaire
+        else:
+            types.append("unknown")
+
+    # Détection couplets / triplets / runs (ectopiques consécutifs)
+    couplets = triplets = runs = 0
+    i = 0
+    while i < len(ectopic_indices):
+        run_len = 1
+        while (i + run_len < len(ectopic_indices) and
+               ectopic_indices[i + run_len] == ectopic_indices[i + run_len - 1] + 1):
+            run_len += 1
+        if run_len == 2:
+            couplets += 1
+        elif run_len == 3:
+            triplets += 1
+        elif run_len > 3:
+            runs += 1
+            run_start = rr_ts[ectopic_indices[i]]
+            run_end = rr_ts[min(ectopic_indices[i + run_len - 1], len(rr_ts) - 1)]
+            run_dur_s = (run_end - run_start).total_seconds()
+            run_rr = rr[ectopic_indices[i]:ectopic_indices[i] + run_len]
+            run_bpm = 60000 / np.mean(run_rr)
+            log(f"  Run @{run_start.strftime('%H:%M:%S')} — {run_len} beats — {run_bpm:.0f} bpm — {run_dur_s:.1f}s")
+        i += run_len
+
+    timestamps = [rr_ts[i] for i in ectopic_indices if i < len(rr_ts)]
+    total = len(ectopic_indices)
+    n_sveb = types.count("SVEB")
+    n_veb  = types.count("VEB")
+
+    log(f"\n[ectopic] ── EXTRASYSTOLES ──────────────────────")
+    log(f"  Total        : {total}")
+    log(f"  SVEB (supraven.) : {n_sveb} ({n_sveb/total*100:.1f}%)")
+    log(f"  VEB  (ventric.)  : {n_veb}  ({n_veb/total*100:.1f}%)")
+    log(f"  Couplets     : {couplets}")
+    log(f"  Triplets     : {triplets}")
+    log(f"  Runs (>3)    : {runs}")
+
+    if len(rr_ts) > 1:
+        duration_h = (rr_ts[-1] - rr_ts[0]).total_seconds() / 3600
+        if duration_h > 0:
+            log(f"  Fréquence    : {total / duration_h:.1f} /heure")
+
+    log(f"────────────────────────────────────────────────")
+
+    return {
+        "count": total, "sveb": n_sveb, "veb": n_veb,
+        "couplets": couplets, "triplets": triplets, "runs": runs,
+        "indices": ectopic_indices, "types": types, "timestamps": timestamps,
+    }
+
+
+def plot_ectopics(rr_ts, rr, ectopics):
+    if not ectopics or ectopics["count"] == 0:
+        return
+
+    indices = ectopics["indices"]
+    types   = ectopics["types"]
+    ts_ect  = ectopics["timestamps"]
+    rr_ect  = rr[indices]
+
+    colors = {"SVEB": "#e67e22", "VEB": "#e74c3c", "unknown": "#95a5a6"}
+    c = [colors.get(t, "#95a5a6") for t in types]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                                   gridspec_kw={"height_ratios": [2, 1]})
+    fig.suptitle("Distribution des extrasystoles")
+
+    # Tachogramme RR + ectopiques marqués
+    ax1.plot(rr_ts, rr, color="#2980b9", linewidth=0.6, alpha=0.7, label="RR (ms)")
+    ax1.scatter(ts_ect, rr_ect, c=c, s=18, zorder=5, label="Ectopique")
+    ax1.set_ylabel("RR (ms)")
+
+    from matplotlib.patches import Patch
+    legend_patches = [
+        Patch(color="#e67e22", label=f"SVEB ({ectopics['sveb']})"),
+        Patch(color="#e74c3c", label=f"VEB ({ectopics['veb']})"),
+    ]
+    ax1.legend(handles=legend_patches + ax1.get_lines()[:1], fontsize=8)
+
+    # Densité horaire des ectopiques
+    if len(ts_ect) > 1:
+        import matplotlib.dates as mdates
+        ax2.hist(
+            mdates.date2num(ts_ect),
+            bins=max(1, int((rr_ts[-1] - rr_ts[0]).total_seconds() / 600)),  # bins de 10 min
+            color="#c0392b", alpha=0.7
+        )
+        ax2.xaxis_date()
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax2.set_ylabel("Ectopiques / 10 min")
+        ax2.set_xlabel("Temps")
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.show()
+
+
 def sliding_hrv(timestamps, rr, window_min):
     window = timedelta(minutes=window_min)
     step   = timedelta(minutes=1)
@@ -240,6 +379,10 @@ def run(path, window_min, use_marker, use_full, no_gru, custom_marker=None):
 
     peaks, rr = compute_rr_from_ecg(ecg, SR)
     rr_ts = ts_ecg[peaks][1:]
+
+    # ── ectopiques
+    ectopics = detect_ectopics(ecg, peaks, rr, rr_ts, SR)
+    plot_ectopics(rr_ts, rr, ectopics)
 
     # ── sliding HRV
     times, rmssd, hr = sliding_hrv(rr_ts, rr, window_min)
