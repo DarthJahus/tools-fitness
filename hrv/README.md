@@ -356,7 +356,8 @@ Please open issues or submit pull requests.
 - [ ] ISSUE: **Sleep Overview** graphic, with `--custom-marker`, only shows data within the marker's window. Should show the whole data and highlight the marker's window.
 - [ ] ISSUE: **HRV detail** graphic, with `--custom-marker`, only shows data within the marker's window. Should show the whole data and highlight the marker's window.
 - [ ] ISSUE: `wrn-gru-mesa` classifier is yielding weird results.
-
+- [ ] Suppress **DFA_alpha2 related warnings** or give enough data to NeuroKit to compute DFA_alpha2.
+ 
 ## Related Tools
 
 - [`fit_cardio.py`](fit_cardio.md) — Heart rate zone analysis from FIT files
