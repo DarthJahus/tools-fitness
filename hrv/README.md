@@ -30,7 +30,7 @@ Analyze heart rate variability from raw ECG recordings (Polar H10 via Polar Sens
 - **Ectopic beat detection** — SVEB/VEB classification, couplets, triplets, runs (>3); excluded from all HRV metrics
 - **Sliding HRV windows** (RMSSD, HR) with configurable window size; gap-safe (dropouts are skipped, not fatal)
 - **HRV by hour** — RMSSD, HR, and ectopic count aggregated per hour
-- **Spectral analysis** — LF/HF via Welch PSD on 4 Hz cubic spline resampled signal (Readiness mode)
+- **Spectral analysis** — LF/HF via Lomb-Scargle periodogram (no interpolation, variance-normalized); Welch on 4 Hz cubic spline resampled signal available as secondary method (Readiness mode)
 - **Poincaré geometry** — SD1, SD2, SD1/SD2 ratio
 - **Sleep staging** — rule-based (RMSSD/HR thresholds) or GRU/WaveNet model via SleepECG (`wrn-gru-mesa`)
 - **Ectopics × sleep stage** — ectopic distribution per estimated stage logged after staging
@@ -129,17 +129,17 @@ All console output is mirrored to a timestamped `.txt` file (e.g. `hrv_night_202
 
 ## Command Line Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--path DIR` | Folder containing ECG/MARKER files | *(required)* |
-| `--mode` | `night` / `readiness` / `exercise` | `night` |
-| `--window INT` | Sliding HRV window in minutes | `5` |
-| `--no-marker` | Ignore marker file, analyze full recording | off |
-| `--no-gru` | Use rule-based staging instead of GRU model | off |
-| `--no-sleep` | Skip sleep staging entirely | off |
-| `--hrv-detail` | 5-min windowed RMSSD/SDNN/pNN50/DFA α1, aggregated by hour | off |
-| `--custom-marker START STOP` | Manual marker window (ISO 8601 timestamps) | — |
-| `--output DIR` | Directory for timestamped log file | — |
+| Option                                 | Description                                               | Default |
+|----------------------------------------|-----------------------------------------------------------|---------|
+| `--path DIR`                           | Folder containing ECG/MARKER files                        | *(required)* |
+| `--mode`                               | `night` / `readiness` / `exercise`                        | `night` |
+| `--window INT`                         | Sliding HRV window in minutes                             | `5` |
+| `--no-marker`                          | Ignore marker file, analyze full recording                | off |
+| `--no-gru`                             | Use rule-based staging instead of GRU model               | off |
+| `--no-sleep`                           | Skip sleep staging entirely                               | off |
+| `--hrv-detail`                         | 5-min windowed RMSSD/SDNN/pNN50/DFA α1, aggregated by hour | off |
+| `--custom-marker START STOP\|DURATION` | Manual marker window. `END` is an ISO 8601 timestamp or a duration in minutes as integer | — |
+| `--output DIR`                         | Directory for timestamped log file                        | — |
 
 ---
 
@@ -223,10 +223,11 @@ Values decrease with age — a 36-year-old and a 53-year-old should not be compa
 Standard deviation of all RR intervals. Reflects total autonomic variability. Inflated on full-night recordings due to inter-cycle transitions — interpret with caution outside standardized 5-min windows.
 
 ### LF/HF Ratio
-Power ratio between low-frequency (0.04–0.15 Hz) and high-frequency (0.15–0.40 Hz) spectral bands, computed via Welch periodogram on 4 Hz cubic spline resampled signal.
+Power ratio between low-frequency (0.04–0.15 Hz) and high-frequency (0.15–0.40 Hz) spectral bands, computed via Lomb-Scargle periodogram directly on non-interpolated RR intervals (variance-normalized). Welch periodogram (4 Hz cubic spline, linear detrend post-resampling) available as secondary method.
 
 | Range | Interpretation |
 |-------|----------------|
+| < 1.0 | Parasympathetic dominance (HF > LF) |
 | < 2.0 | Balanced autonomic regulation |
 | 2.0–4.0 | Mild sympathetic dominance / elevated strain |
 | > 4.0 | Marked sympathetic dominance / acute autonomic stress |
@@ -343,7 +344,7 @@ Please open issues or submit pull requests.
 |---------|---------|
 | `numpy` | Numerical core |
 | `matplotlib` | All plots |
-| `scipy` | Welch PSD, cubic spline interpolation |
+| `scipy` | Lomb-Scargle & Welch PSD, cubic spline interpolation, linear detrend |
 | `neurokit2` | ECG cleaning, R-peak detection, windowed HRV |
 | `sleepecg` | GRU-based sleep staging *(optional)* |
 | `tensorflow` | Required by SleepECG GRU model *(optional)* |
