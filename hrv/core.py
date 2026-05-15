@@ -15,7 +15,8 @@ from constants import (
     N3_RMSSD_THRESHOLD,
     REM_RMSSD_THRESHOLD,
     N2_RMSSD_THRESHOLD,
-    WAKE_RMSSD_THRESHOLD, ECG_SAMPLE_RATE, WINDOW_S, STEP_S, SR_FAKE, STAGE_MAPS
+    WAKE_RMSSD_THRESHOLD, ECG_SAMPLE_RATE, WINDOW_S, STEP_S, SR_FAKE, STAGE_MAPS, VLF_BAND, HF_BAND, FS_RESAMPLE,
+    LF_BAND
 )
 
 
@@ -73,27 +74,20 @@ Both methods return the same dict keys so callers can swap method= transparently
 """
 
 
-
-
-
-
-# ── Band definitions (Hz) ─────────────────────────────────────────────────────
-VLF_BAND = (0.00, 0.04)
-LF_BAND  = (0.04, 0.15)
-HF_BAND  = (0.15, 0.40)
-FS_RESAMPLE = 4.0          # Hz — Task Force 1996 standard
-
-
-def _band_power(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
-    """Integrate PSD over a frequency band. PSD units: s²/Hz → returns ms²."""
+def _band_power(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float],
+                unit_scale: float = 1.0) -> float:
+    """Integrate PSD over a frequency band.
+    unit_scale=1.0  when PSD is already in ms²/Hz  (Lomb-Scargle after fix)
+    unit_scale=1e6  when PSD is in s²/Hz           (Welch, signal in seconds)
+    """
     mask = (freqs >= band[0]) & (freqs <= band[1])
-    df   = freqs[1] - freqs[0] if len(freqs) > 1 else 0.0
-    return float(np.sum(psd[mask]) * df * 1_000_000.0)
+    df = freqs[1] - freqs[0] if len(freqs) > 1 else 0.0
+    return float(np.sum(psd[mask]) * df * unit_scale)
 
 
 def _band_peak(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
     mask = (freqs >= band[0]) & (freqs <= band[1])
-    sub  = psd[mask]
+    sub = psd[mask]
     return float(freqs[mask][np.argmax(sub)]) if sub.size > 0 else 0.0
 
 
@@ -104,6 +98,8 @@ def _empty_result() -> dict:
         "lf_hf": 0.0, "lf_peak": 0.0, "hf_peak": 0.0,
         "lf_nu": 0.0, "hf_nu": 0.0,
     }
+
+
 
 
 # ── Method 1 : Lomb-Scargle ───────────────────────────────────────────────────
@@ -122,33 +118,38 @@ def _lomb_scargle(rr_ms: np.ndarray) -> dict:
     if len(rr_ms) < 12:
         return _empty_result()
 
-    rr_sec  = rr_ms / 1000.0
-    t       = np.cumsum(rr_sec) - rr_sec[0]          # timestamps (s)
-    rr_dt   = detrend(rr_sec, type="linear")          # remove linear trend
+    rr_sec = rr_ms / 1000.0
+    t = np.cumsum(rr_sec) - rr_sec[0]  # timestamps (s)
+    rr_dt = detrend(rr_sec, type="linear")  # remove linear trend
 
     # Hann window to reduce spectral leakage
-    window  = np.hanning(len(rr_dt))
-    rr_win  = rr_dt * window
+    window = np.hanning(len(rr_dt))
+    rr_win = rr_dt * window
 
     # Frequency resolution: 1/T, capped to stay within physiological bands
-    T       = t[-1] - t[0]
-    f_min   = max(VLF_BAND[0], 1.0 / T) if T > 0 else VLF_BAND[0]
-    f_max   = HF_BAND[1]
-    n_freqs = max(512, int(T * 10))                   # ≥10 points per Hz
-    freqs   = np.linspace(f_min, f_max, n_freqs)
+    T = t[-1] - t[0]
+    f_min = max(VLF_BAND[0], 1.0 / T) if T > 0 else VLF_BAND[0]
+    f_max = HF_BAND[1]
+    n_freqs = max(512, int(T * 10))  # ≥10 points per Hz
+    freqs = np.linspace(f_min, f_max, n_freqs)
 
     ang_freqs = 2 * np.pi * freqs
-    psd_ls    = lombscargle(t, rr_win, ang_freqs, normalize=False)
+    psd_raw = lombscargle(t, rr_win, ang_freqs, normalize=False)
 
-    # Normalise to physical units (s²/Hz) via the Hann-corrected variance
-    # Factor: PSD = 2 * amplitude² / (N * fs_equiv)
-    # Approximate fs for normalisation
-    fs_equiv  = len(rr_sec) / T if T > 0 else FS_RESAMPLE
-    norm      = (2.0 / (len(rr_win) * fs_equiv))
-    psd_s2hz  = psd_ls * norm
+    # Normalize so that the integral of the PSD equals the signal variance (ms²).
+    # scipy lombscargle(normalize=False) returns values in U² (not U²/Hz).
+    # Variance is computed on the windowed, detrended signal in ms (not seconds)
+    # so the resulting PSD will be in ms²/Hz, consistent with Welch output.
+    rr_ms_dt = detrend(rr_ms, type="linear")
+    window_ms = np.hanning(len(rr_ms_dt))
+    variance_ms2 = float(np.var(rr_ms_dt))
 
-    return _build_result("lomb-scargle", freqs, psd_s2hz)
+    df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
+    raw_integral = float(np.sum(psd_raw) * df)
+    scale = variance_ms2 / raw_integral if raw_integral > 0 else 1.0
+    psd_ms2hz = psd_raw * scale
 
+    return _build_result("lomb-scargle", freqs, psd_ms2hz)
 
 # ── Method 2 : Welch (corrected) ─────────────────────────────────────────────
 
@@ -168,38 +169,41 @@ def _welch_corrected(rr_ms: np.ndarray) -> dict:
     if len(rr_ms) < 12:
         return _empty_result()
 
-    rr_sec   = rr_ms / 1000.0
-    t_irr    = np.cumsum(rr_sec) - rr_sec[0]
+    rr_sec = rr_ms / 1000.0
+    t_irr = np.cumsum(rr_sec) - rr_sec[0]
 
-    t_even   = np.arange(0.0, t_irr[-1], 1.0 / FS_RESAMPLE)
+    t_even = np.arange(0.0, t_irr[-1], 1.0 / FS_RESAMPLE)
     if len(t_even) < 8:
         return _empty_result()
 
-    cs       = CubicSpline(t_irr, rr_sec)
-    rr_even  = cs(t_even)
-    rr_even  = detrend(rr_even, type="linear")        # ← after interpolation
+    cs = CubicSpline(t_irr, rr_sec)
+    rr_even = cs(t_even)
+    rr_even = detrend(rr_even, type="linear")  # ← after interpolation
 
     # nperseg strategy: full length for readiness (≤600 pts), 512 for night
-    nperseg  = len(rr_even) if len(rr_even) <= 600 else 512
+    nperseg = len(rr_even) if len(rr_even) <= 600 else 512
 
     freqs, psd = welch(
         rr_even,
-        fs       = FS_RESAMPLE,
-        nperseg  = nperseg,
-        window   = "hann",
-        noverlap = nperseg // 2,
-        scaling  = "density",
+        fs=FS_RESAMPLE,
+        nperseg=nperseg,
+        window="hann",
+        noverlap=nperseg // 2,
+        scaling="density",
     )
 
     return _build_result("welch", freqs, psd)
 
-
 # ── Shared result builder ─────────────────────────────────────────────────────
 
 def _build_result(method: str, freqs: np.ndarray, psd: np.ndarray) -> dict:
-    vlf   = _band_power(freqs, psd, VLF_BAND)
-    lf    = _band_power(freqs, psd, LF_BAND)
-    hf    = _band_power(freqs, psd, HF_BAND)
+    # Welch PSD is in s²/Hz (signal was in seconds) → scale by 1e6 to get ms²
+    # Lomb-Scargle PSD is already in ms²/Hz after variance normalization
+    scale = 1_000_000.0 if method == "welch" else 1.0
+
+    vlf = _band_power(freqs, psd, VLF_BAND, scale)
+    lf = _band_power(freqs, psd, LF_BAND, scale)
+    hf = _band_power(freqs, psd, HF_BAND, scale)
     total = vlf + lf + hf
 
     # Normalised units (nu): relative power within LF+HF only
@@ -208,22 +212,24 @@ def _build_result(method: str, freqs: np.ndarray, psd: np.ndarray) -> dict:
     hf_nu = (hf / lf_hf_sum * 100.0) if lf_hf_sum > 0 else 0.0
 
     return {
-        "method":      method,
-        "vlf_power":   round(vlf,   2),
-        "lf_power":    round(lf,    2),
-        "hf_power":    round(hf,    2),
+        "method": method,
+        "vlf_power": round(vlf, 2),
+        "lf_power": round(lf, 2),
+        "hf_power": round(hf, 2),
         "total_power": round(total, 2),
-        "lf_hf":       round(lf / hf, 4) if hf > 0 else 0.0,
-        "lf_peak":     round(_band_peak(freqs, psd, LF_BAND), 4),
-        "hf_peak":     round(_band_peak(freqs, psd, HF_BAND), 4),
-        "lf_nu":       round(lf_nu, 1),
-        "hf_nu":       round(hf_nu, 1),
+        "lf_hf": round(lf / hf, 4) if hf > 0 else 0.0,
+        "lf_peak": round(_band_peak(freqs, psd, LF_BAND), 4),
+        "hf_peak": round(_band_peak(freqs, psd, HF_BAND), 4),
+        "lf_nu": round(lf_nu, 1),
+        "hf_nu": round(hf_nu, 1),
     }
-
 
 # ── Public interface ──────────────────────────────────────────────────────────
 
-def compute_frequency_metrics(rr_clean: np.ndarray, method: str = "lomb-scargle") -> dict:
+def compute_frequency_metrics(
+        rr_clean: np.ndarray,
+        method: str = "lomb-scargle",
+) -> dict:
     """
     Compute HRV frequency-domain metrics.
 
@@ -252,7 +258,7 @@ def compute_frequency_metrics(rr_clean: np.ndarray, method: str = "lomb-scargle"
     elif method == "both":
         return {
             "lomb-scargle": _lomb_scargle(rr),
-            "welch":        _welch_corrected(rr),
+            "welch": _welch_corrected(rr),
         }
     else:
         raise ValueError(f"Unknown method '{method}'. Use 'lomb-scargle', 'welch', or 'both'.")
@@ -390,11 +396,11 @@ def run_mode_readiness(rr, rr_ts):
     log(f"  LF/HF Ratio  : {lf_hf_val:.2f}")
     log(f"  Interpretation: {interp}")
 
-    f_both = compute_frequency_metrics(rr_clean, method="both")
-    for m_name, m_data in f_both.items():
-        log(f"\n  [{m_name}] LF/HF={m_data['lf_hf']:.2f} | "
-            f"LF={m_data['lf_power']:.1f} | HF={m_data['hf_power']:.1f} | "
-            f"Total={m_data['total_power']:.1f}")
+    #f_both = compute_frequency_metrics(rr_clean, method="both")
+    #for m_name, m_data in f_both.items():
+    #    log(f"\n  [{m_name}] LF/HF={m_data['lf_hf']:.2f} | "
+    #        f"LF={m_data['lf_power']:.1f} | HF={m_data['hf_power']:.1f} | "
+    #        f"Total={m_data['total_power']:.1f}")
 
     log("\n── POINCARÉ GEOMETRY ──")
     log(f"  SD1 (Short)  : {sd1:.1f} ms")

@@ -16,3 +16,8 @@ STAGE_MAPS = {
     "wake-sleep": {0: "WAKE", 1: "SLEEP"},
     "wake-rem-light-deep": {0: "WAKE", 1: "REM", 2: "LIGHT", 3: "DEEP"},
 }
+# ── Band definitions (Hz) ─────────────────────────────────────────────────────
+VLF_BAND = (0.00, 0.04)
+LF_BAND  = (0.04, 0.15)
+HF_BAND  = (0.15, 0.40)
+FS_RESAMPLE = 4.0          # Hz — Task Force 1996 standard
