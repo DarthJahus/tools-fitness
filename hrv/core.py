@@ -6,8 +6,8 @@ from datetime import timedelta
 import neurokit2 as nk
 from collections import Counter
 from matplotlib.patches import Patch
-from hrv.utils import log
-from hrv.constants import (
+from utils import log
+from constants import (
     EPOCH_S,
     WAKE_HR_THRESHOLD,
     N3_RMSSD_THRESHOLD,

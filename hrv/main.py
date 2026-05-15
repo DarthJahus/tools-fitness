@@ -2,14 +2,14 @@ import os
 import numpy as np
 from datetime import datetime
 import argparse
-from hrv.core import (
+from core import (
     compute_rr_from_ecg,
     run_mode_night,
     run_mode_readiness,
     run_mode_exercise
 )
-from hrv.io import find_file, load_ecg, load_marker
-from hrv.utils import parse_ts, init_log, close_log, log
+from file_io import find_file, load_ecg, load_marker
+from utils import parse_ts, init_log, close_log, log
 from constants import ECG_SAMPLE_RATE, RR_MIN_MS, RR_MAX_MS
 
 

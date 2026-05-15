@@ -1,7 +1,7 @@
 import os
 import glob
 import numpy as np
-from hrv.utils import log, read_csv, parse_ts
+from utils import log, read_csv, parse_ts
 
 
 def find_file(path, keyword, required=True):
