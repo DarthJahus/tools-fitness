@@ -1,13 +1,8 @@
 import os
 import glob
 import numpy as np
-from utils import log, read_csv, parse_ts, LOG_FILE
+from hrv.utils import log, read_csv, parse_ts
 
-ECG_SAMPLE_RATE = 130  # Hz — Polar H10 via Polar Sensor Logger
-
-# ─────────────────────────────────────────────────────────────
-# FILE DISCOVERY
-# ─────────────────────────────────────────────────────────────
 
 def find_file(path, keyword, required=True):
     files = glob.glob(os.path.join(path, f"*{keyword}*.txt"))
@@ -19,12 +14,9 @@ def find_file(path, keyword, required=True):
         )
     return None
 
-# ─────────────────────────────────────────────────────────────
-# LOADERS
-# ─────────────────────────────────────────────────────────────
 
 def load_ecg(file):
-    log(LOG_FILE, f"[ecg] {file}")
+    log(f"[ecg] {file}")
     rows = read_csv(file)
     ts, ecg = [], []
     skipped = 0
@@ -38,16 +30,16 @@ def load_ecg(file):
         except (ValueError, IndexError):
             skipped += 1
     if skipped:
-        log(LOG_FILE, f"[ecg] {skipped} lines skipped (parse errors)")
+        log(f"[ecg] {skipped} lines skipped (parse errors)")
     return np.array(ts), np.array(ecg)
 
 
 def load_marker(file):
     if not file:
-        log(LOG_FILE, "[marker] none found")
+        log("[marker] none found")
         return None, None
 
-    log(LOG_FILE, f"[marker] {file}")
+    log(f"[marker] {file}")
     rows = read_csv(file)
 
     start = stop = None
@@ -60,10 +52,8 @@ def load_marker(file):
         if label == "MARKER_STOP":  stop  = ts
 
     if start and stop:
-        log(LOG_FILE, f"[marker] window: {start} → {stop}")
+        log(f"[marker] window: {start} → {stop}")
     else:
-        log(LOG_FILE, "[marker] invalid or incomplete")
+        log("[marker] invalid or incomplete")
 
     return start, stop
-
-
