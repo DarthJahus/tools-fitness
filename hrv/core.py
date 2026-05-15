@@ -224,10 +224,7 @@ def _build_result(method: str, freqs: np.ndarray, psd: np.ndarray) -> dict:
 
 # ── Public interface ──────────────────────────────────────────────────────────
 
-def compute_frequency_metrics(
-        rr_clean: np.ndarray,
-        method: str = "lomb-scargle",
-) -> dict:
+def compute_frequency_metrics(rr_clean: np.ndarray, method: str = "lomb-scargle") -> dict:
     """
     Compute HRV frequency-domain metrics.
 
@@ -586,7 +583,7 @@ def run_mode_night(args, rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False,
     log(f"  Bradycardia  : {t_metrics['brady_pct']:.1f} % of total session beats")
 
     # Spectral Analysis over the entire clean resting recording context
-    f_metrics = compute_frequency_metrics(rr_clean)
+    f_metrics = compute_frequency_metrics(rr_clean, method="welch")
     log(f"  Overnight LF/HF Ratio: {f_metrics['lf_hf']:.2f}")
 
     # Process heart rate zones mapping for the sleep timeline
