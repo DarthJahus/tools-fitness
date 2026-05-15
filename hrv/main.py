@@ -65,31 +65,21 @@ def build_parser() -> argparse.ArgumentParser:
         help='Calculate max HR from age using 220-age formula, then compute zones'
     )
 
-    # 2. CRÉER LES SOUS-PARSERS APRÈS (Ils hériteront ainsi correctement des zones)
-    sub = root.add_subparsers(dest="mode", required=True, metavar="MODE",
-                              help="night | readiness | exercise")
+    sub = root.add_subparsers(dest="mode", required=True, metavar="MODE", help="night | readiness | exercise")
 
     # ── night ────────────────────────────────────────────────
-    night = sub.add_parser("night", parents=[shared],
-                           help="Full overnight recovery analysis (default)")
-    night.add_argument("--window",     type=int, default=5,
-                       help="Sliding HRV window in minutes (default: 5)")
-    night.add_argument("--no-gru",     action="store_true",
-                       help="Rule-based sleep staging — skips TensorFlow/GRU")
-    night.add_argument("--no-sleep",   action="store_true",
-                       help="Disable sleep staging entirely")
-    night.add_argument("--hrv-detail", action="store_true",
-                       help="5-min windowed RMSSD/SDNN/pNN50/DFA α1, aggregated by hour")
+    night = sub.add_parser("night", parents=[shared], help="Full overnight recovery analysis (default)")
+    night.add_argument("--window", type=int, default=5, help="Sliding HRV window in minutes (default: 5)")
+    night.add_argument("--use-gru", action="store_true", help="Use TensorFlow/GRU sleep staging (Defaults to rule-based)")
+    night.add_argument("--no-sleep", action="store_true", help="Disable sleep staging entirely")
+    night.add_argument("--hrv-detail", action="store_true", help="5-min windowed RMSSD/SDNN/pNN50/DFA α1, aggregated by hour")
 
     # ── readiness ────────────────────────────────────────────
-    sub.add_parser("readiness", parents=[shared],
-                   help="Short resting window (3–10 min) — requires --custom-marker")
+    sub.add_parser("readiness", parents=[shared], help="Short resting window (3–10 min) — requires --custom-marker")
 
     # ── exercise ─────────────────────────────────────────────
-    exercise = sub.add_parser("exercise", parents=[shared],
-                              help="Exercise session analysis (10-min segments)")
-    exercise.add_argument("--window", type=int, default=10,
-                          help="Segment duration in minutes (default: 10)")
+    exercise = sub.add_parser("exercise", parents=[shared], help="Exercise session analysis (10-min segments)")
+    exercise.add_argument("--window", type=int, default=10, help="Segment duration in minutes (default: 10)")
 
     return root
 
@@ -191,7 +181,7 @@ def _run_inner(args, custom_marker):
             window_min=args.window,
             hrv_detail=args.hrv_detail,
             no_sleep=args.no_sleep,
-            no_gru=args.no_gru,
+            use_gru=args.use_gru,
             m_start=m_start,
             m_stop=m_stop
         )

@@ -526,7 +526,7 @@ def run_mode_exercise(args, rr, rr_ts, window_min=10):
     log("─" * 60)
 
 
-def run_mode_night(args, rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sleep=False, no_gru=False, m_start=None, m_stop=None):
+def run_mode_night(args, rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sleep=False, use_gru=False, m_start=None, m_stop=None):
     """
     Executes standard overnight physiological sleep analysis protocol.
     Aggregates indicators by hour and tracks autonomic recovery.
@@ -602,10 +602,10 @@ def run_mode_night(args, rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False,
 
     # Sleep classification execution path
     if not no_sleep:
-        if no_gru:
-            sleep_staging_rule_based(rr_clean, rr_ts_clean, times, rmssd, hr, ectopics)
+        if use_gru:
+            sleep_staging(ecg, ECG_SAMPLE_RATE, ts_ecg, times, rmssd, hr, ectopics, rr_ts_clean=rr_ts_clean)
         else:
-            sleep_staging(ecg, ECG_SAMPLE_RATE, ts_ecg, times, rmssd, hr, ectopics)
+            sleep_staging_rule_based(rr_clean, rr_ts_clean, times, rmssd, hr, ectopics)
 
     # Secondary window detailed analytics parsing
     if hrv_detail:
@@ -1155,22 +1155,30 @@ def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr, ectopics=None):
     ectopics_by_stage(ectopics, epochs_ts, labels)
 
 
-def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr, ectopics=None):
+def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr, ectopics=None, rr_ts_clean=None):
     import sleepecg
     import logging
     import warnings
+    from collections import Counter
 
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
     logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
     log()
-    log("[sleep] detecting heartbeats (Pan-Tompkins)…")
-    beats = sleepecg.detect_heartbeats(ecg, sr)
-    log(f"[sleep] beats detected: {len(beats):,}")
 
-    beat_times = beats / sr
+    if rr_ts_clean is not None and len(rr_ts_clean) > 0:
+        log("[sleep] using pre-cleaned, filtered upstream R-peak timestamps")
+        # Convert datetime timestamps to absolute elapsed seconds from the start
+        beat_times = np.array([(t - ts_ecg[0]).total_seconds() for t in rr_ts_clean])
+    else:
+        log("[sleep] warning: falling back to raw Pan-Tompkins heartbeat detection")
+        beats = sleepecg.detect_heartbeats(ecg, sr)
+        beat_times = beats / sr
 
+    log(f"[sleep] processing {len(beat_times):,} stable heartbeats for feature extraction")
+
+    # Build the record with perfectly aligned heartbeat vectors
     record = sleepecg.SleepRecord(
         sleep_stage_duration=30,
         recording_start_time=ts_ecg[0],
@@ -1196,7 +1204,7 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr, ectopics=None):
 
     labels_str = [stage_map.get(int(s), "?") for s in stages_pred]
     counts = Counter(labels_str)
-    total  = len(labels_str)
+    total = len(labels_str)
     log(f"\n[sleep] {total} epochs × 30s = {total * 30 / 3600:.1f}h")
     for label in stage_labels:
         count = counts.get(label, 0)
