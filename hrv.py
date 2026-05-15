@@ -544,7 +544,7 @@ def run_hrv_detail(rr, rr_ts, m_start, m_stop):
 # RUN
 # ─────────────────────────────────────────────────────────────
 
-def run(path, window_min, use_marker, hrv_detail, no_gru, custom_marker=None, output=None):
+def run(path, window_min, use_marker, hrv_detail, no_sleep, no_gru, custom_marker=None, output=None):
     global _log_file
     if output:
         os.makedirs(output, exist_ok=True)
@@ -554,14 +554,14 @@ def run(path, window_min, use_marker, hrv_detail, no_gru, custom_marker=None, ou
         log(f"[output] logging to {log_path}")
 
     try:
-        _run_inner(path, window_min, use_marker, hrv_detail, no_gru, custom_marker)
+        _run_inner(path, window_min, use_marker, hrv_detail, no_sleep, no_gru, custom_marker)
     finally:
         if _log_file is not None:
             _log_file.close()
             _log_file = None
 
 
-def _run_inner(path, window_min, use_marker, hrv_detail, no_gru, custom_marker):
+def _run_inner(path, window_min, use_marker, hrv_detail, no_sleep, no_gru, custom_marker):
 
     log("[init] discovering files")
     ecg_file    = find_file(path, "ECG", required=True)
@@ -664,10 +664,11 @@ def _run_inner(path, window_min, use_marker, hrv_detail, no_gru, custom_marker):
     log("  nuage serré = rigidité cardiaque")
 
     # ── sleep staging
-    if no_gru:
-        sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr, ectopics)
-    else:
-        sleep_staging(ecg, ECG_SAMPLE_RATE, ts_ecg, times, rmssd, hr, ectopics)
+    if not no_sleep:
+        if no_gru:
+            sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr, ectopics)
+        else:
+            sleep_staging(ecg, ECG_SAMPLE_RATE, ts_ecg, times, rmssd, hr, ectopics)
 
     # ── hrv detail (optional)
     if hrv_detail:
@@ -929,6 +930,7 @@ Useful reading:
     p.add_argument("--window",  type=int, default=5, help="Sliding window (minutes)")
     p.add_argument("--no-marker",   action="store_true", help="Ignore marker file → analyze full recording")
     p.add_argument("--no-gru",      action="store_true", help="Use rule-based hypnogram, without TensorFlow/GRU")
+    p.add_argument("--no-sleep", action="store_true")
     p.add_argument("--hrv-detail",   action="store_true", help="Windowed HRV detail: RMSSD/SDNN/pNN50/DFAα1 by 5-min windows, aggregated by hour")
     p.add_argument("--output", metavar="DIR", default=None,
                    help="Directory to write a timestamped .txt log (default: stdout only)")
@@ -954,6 +956,7 @@ Useful reading:
         use_marker=not args.no_marker,
         hrv_detail=args.hrv_detail,
         no_gru=args.no_gru,
+        no_sleep=args.no_sleep,
         custom_marker=custom_marker,
         output=args.output,
     )
