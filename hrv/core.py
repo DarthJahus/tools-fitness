@@ -1,5 +1,4 @@
 import os
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import timedelta
@@ -7,6 +6,9 @@ import neurokit2 as nk
 from collections import Counter
 from matplotlib.patches import Patch
 from utils import log
+import numpy as np
+from scipy.signal import detrend, welch
+from scipy.interpolate import CubicSpline
 from constants import (
     EPOCH_S,
     WAKE_HR_THRESHOLD,
@@ -58,77 +60,215 @@ def compute_time_metrics(rr_clean):
     }
 
 
-def compute_frequency_metrics(rr_clean):
+"""
+HRV Frequency Domain Analysis
+==============================
+Primary method  : Lomb-Scargle periodogram (no interpolation, no resampling artifacts)
+Secondary method: Welch periodogram (corrected detrending + nperseg)
+Reference bands : VLF 0.00–0.04 Hz / LF 0.04–0.15 Hz / HF 0.15–0.40 Hz
+Input           : rr_clean — 1D numpy array of RR intervals in milliseconds,
+                  ectopics already removed.
+
+Both methods return the same dict keys so callers can swap method= transparently.
+"""
+
+
+
+
+
+
+# ── Band definitions (Hz) ─────────────────────────────────────────────────────
+VLF_BAND = (0.00, 0.04)
+LF_BAND  = (0.04, 0.15)
+HF_BAND  = (0.15, 0.40)
+FS_RESAMPLE = 4.0          # Hz — Task Force 1996 standard
+
+
+def _band_power(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
+    """Integrate PSD over a frequency band. PSD units: s²/Hz → returns ms²."""
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    df   = freqs[1] - freqs[0] if len(freqs) > 1 else 0.0
+    return float(np.sum(psd[mask]) * df * 1_000_000.0)
+
+
+def _band_peak(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
+    mask = (freqs >= band[0]) & (freqs <= band[1])
+    sub  = psd[mask]
+    return float(freqs[mask][np.argmax(sub)]) if sub.size > 0 else 0.0
+
+
+def _empty_result() -> dict:
+    return {
+        "method": "none",
+        "lf_power": 0.0, "hf_power": 0.0, "vlf_power": 0.0, "total_power": 0.0,
+        "lf_hf": 0.0, "lf_peak": 0.0, "hf_peak": 0.0,
+        "lf_nu": 0.0, "hf_nu": 0.0,
+    }
+
+
+# ── Method 1 : Lomb-Scargle ───────────────────────────────────────────────────
+
+def _lomb_scargle(rr_ms: np.ndarray) -> dict:
     """
-    Applies 4 Hz cubic spline interpolation and Welch periodogram spectral estimation.
-    Bands: LF (0.04 - 0.15 Hz), HF (0.15 - 0.4 Hz).
+    Compute HRV spectrum via Lomb-Scargle periodogram.
+    Works on unevenly sampled RR intervals — no interpolation required.
+
+    The RR series is treated as a time series where each sample occurs at the
+    cumulative time of its interval.  A Hann-like amplitude correction is applied
+    to reduce spectral leakage before passing to scipy.signal.lombscargle.
     """
-    from scipy.interpolate import CubicSpline
-    from scipy.signal import welch
+    from scipy.signal import lombscargle  # angular-frequency interface
 
-    if len(rr_clean) < 10:
-        return {
-            "lf_hf": 0.0, "lf_power": 0.0, "hf_power": 0.0,
-            "lf_peak": 0.0, "hf_peak": 0.0, "total_power": 0.0
-        }
+    if len(rr_ms) < 12:
+        return _empty_result()
 
-    # Build continuous timeline from interval durations (seconds)
-    rr_sec = rr_clean / 1000.0
-    timeline = np.cumsum(rr_sec) - rr_sec[0]
+    rr_sec  = rr_ms / 1000.0
+    t       = np.cumsum(rr_sec) - rr_sec[0]          # timestamps (s)
+    rr_dt   = detrend(rr_sec, type="linear")          # remove linear trend
 
-    # Define uniform resampling lattice at 4 Hz
-    fs_resample = 4.0
-    t_uniform = np.arange(0, timeline[-1], 1.0 / fs_resample)
+    # Hann window to reduce spectral leakage
+    window  = np.hanning(len(rr_dt))
+    rr_win  = rr_dt * window
 
-    if len(t_uniform) < 4:
-        return {
-            "lf_hf": 0.0, "lf_power": 0.0, "hf_power": 0.0,
-            "lf_peak": 0.0, "hf_peak": 0.0, "total_power": 0.0
-        }
+    # Frequency resolution: 1/T, capped to stay within physiological bands
+    T       = t[-1] - t[0]
+    f_min   = max(VLF_BAND[0], 1.0 / T) if T > 0 else VLF_BAND[0]
+    f_max   = HF_BAND[1]
+    n_freqs = max(512, int(T * 10))                   # ≥10 points per Hz
+    freqs   = np.linspace(f_min, f_max, n_freqs)
 
-    # De-trend signal by removing local mean
-    rr_detrended = rr_sec - np.mean(rr_sec)
+    ang_freqs = 2 * np.pi * freqs
+    psd_ls    = lombscargle(t, rr_win, ang_freqs, normalize=False)
 
-    cs = CubicSpline(timeline, rr_detrended)
-    rr_uniform: np.ndarray = cs(t_uniform)
+    # Normalise to physical units (s²/Hz) via the Hann-corrected variance
+    # Factor: PSD = 2 * amplitude² / (N * fs_equiv)
+    # Approximate fs for normalisation
+    fs_equiv  = len(rr_sec) / T if T > 0 else FS_RESAMPLE
+    norm      = (2.0 / (len(rr_win) * fs_equiv))
+    psd_s2hz  = psd_ls * norm
 
-    # Run Welch method spectrum estimate (default nperseg logic balanced for short datasets)
-    nperseg = min(256, len(rr_uniform))
-    freqs: np.ndarray
-    psd: np.ndarray
-    freqs, psd = welch(rr_uniform, fs=fs_resample, nperseg=nperseg)
+    return _build_result("lomb-scargle", freqs, psd_s2hz)
 
-    # Define analytical frequency windows
-    lf_mask = (freqs >= 0.04) & (freqs <= 0.15)
-    hf_mask = (freqs >= 0.15) & (freqs <= 0.40)
-    total_mask = (freqs >= 0.00) & (freqs <= 0.40)
 
-    # Resolution width for step integration (converting to ms^2)
-    df = freqs[1] - freqs[0] if len(freqs) > 1 else 0.0
+# ── Method 2 : Welch (corrected) ─────────────────────────────────────────────
 
-    lf_power = np.sum(psd[lf_mask]) * df * 1000000.0
-    hf_power = np.sum(psd[hf_mask]) * df * 1000000.0
-    total_power = np.sum(psd[total_mask]) * df * 1000000.0
+def _welch_corrected(rr_ms: np.ndarray) -> dict:
+    """
+    Welch periodogram on cubic-spline resampled RR series.
 
-    lf_hf = lf_power / hf_power if hf_power > 0.0 else 0.0
+    Fixes vs. original implementation
+    ─────────────────────────────────
+    1. Linear detrend is applied AFTER resampling (not before the spline fit),
+       eliminating the LF artefact caused by detrending in the interval domain.
+    2. nperseg = full signal length for 5-min recordings, giving maximum
+       frequency resolution (df = fs/N ≈ 0.007 Hz at 4 Hz / 256 pts).
+       For longer recordings (night), fall back to 256 to limit compute time.
+    3. Hann window (scipy default) — correct for power-spectral leakage.
+    """
+    if len(rr_ms) < 12:
+        return _empty_result()
 
-    # Find peak power frequencies within bands
-    lf_psd = psd[lf_mask]
-    lf_freqs = freqs[lf_mask]
-    lf_peak = lf_freqs[np.argmax(lf_psd)] if len(lf_psd) > 0 else 0.0
+    rr_sec   = rr_ms / 1000.0
+    t_irr    = np.cumsum(rr_sec) - rr_sec[0]
 
-    hf_psd = psd[hf_mask]
-    hf_freqs = freqs[hf_mask]
-    hf_peak = hf_freqs[np.argmax(hf_psd)] if len(hf_psd) > 0 else 0.0
+    t_even   = np.arange(0.0, t_irr[-1], 1.0 / FS_RESAMPLE)
+    if len(t_even) < 8:
+        return _empty_result()
+
+    cs       = CubicSpline(t_irr, rr_sec)
+    rr_even  = cs(t_even)
+    rr_even  = detrend(rr_even, type="linear")        # ← after interpolation
+
+    # nperseg strategy: full length for readiness (≤600 pts), 512 for night
+    nperseg  = len(rr_even) if len(rr_even) <= 600 else 512
+
+    freqs, psd = welch(
+        rr_even,
+        fs       = FS_RESAMPLE,
+        nperseg  = nperseg,
+        window   = "hann",
+        noverlap = nperseg // 2,
+        scaling  = "density",
+    )
+
+    return _build_result("welch", freqs, psd)
+
+
+# ── Shared result builder ─────────────────────────────────────────────────────
+
+def _build_result(method: str, freqs: np.ndarray, psd: np.ndarray) -> dict:
+    vlf   = _band_power(freqs, psd, VLF_BAND)
+    lf    = _band_power(freqs, psd, LF_BAND)
+    hf    = _band_power(freqs, psd, HF_BAND)
+    total = vlf + lf + hf
+
+    # Normalised units (nu): relative power within LF+HF only
+    lf_hf_sum = lf + hf
+    lf_nu = (lf / lf_hf_sum * 100.0) if lf_hf_sum > 0 else 0.0
+    hf_nu = (hf / lf_hf_sum * 100.0) if lf_hf_sum > 0 else 0.0
 
     return {
-        "lf_hf": lf_hf,
-        "lf_power": lf_power,
-        "hf_power": hf_power,
-        "lf_peak": lf_peak,
-        "hf_peak": hf_peak,
-        "total_power": total_power
+        "method":      method,
+        "vlf_power":   round(vlf,   2),
+        "lf_power":    round(lf,    2),
+        "hf_power":    round(hf,    2),
+        "total_power": round(total, 2),
+        "lf_hf":       round(lf / hf, 4) if hf > 0 else 0.0,
+        "lf_peak":     round(_band_peak(freqs, psd, LF_BAND), 4),
+        "hf_peak":     round(_band_peak(freqs, psd, HF_BAND), 4),
+        "lf_nu":       round(lf_nu, 1),
+        "hf_nu":       round(hf_nu, 1),
     }
+
+
+# ── Public interface ──────────────────────────────────────────────────────────
+
+def compute_frequency_metrics(rr_clean: np.ndarray, method: str = "lomb-scargle") -> dict:
+    """
+    Compute HRV frequency-domain metrics.
+
+    Parameters
+    ----------
+    rr_clean : np.ndarray
+        RR intervals in milliseconds, ectopics already removed.
+    method : str
+        "lomb-scargle"  — primary, recommended for readiness (5 min) [default]
+        "welch"         — corrected Welch, acceptable for night recordings
+        "both"          — returns dict with keys "lomb-scargle" and "welch"
+
+    Returns
+    -------
+    dict with keys:
+        method, vlf_power, lf_power, hf_power, total_power,
+        lf_hf, lf_peak, hf_peak, lf_nu, hf_nu
+    (or nested dict if method="both")
+    """
+    rr = np.asarray(rr_clean, dtype=float)
+
+    if method == "lomb-scargle":
+        return _lomb_scargle(rr)
+    elif method == "welch":
+        return _welch_corrected(rr)
+    elif method == "both":
+        return {
+            "lomb-scargle": _lomb_scargle(rr),
+            "welch":        _welch_corrected(rr),
+        }
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'lomb-scargle', 'welch', or 'both'.")
+
+
+# ── LF/HF interpretation ─────────────────────────────────────────────────────
+
+def interpret_lf_hf(ratio: float) -> str:
+    if ratio < 1.0:
+        return "Parasympathetic dominance (HF > LF)"
+    elif ratio < 2.0:
+        return "Balanced autonomic regulation (Parasympathetic / Sympathetic equilibrium)"
+    elif ratio < 4.0:
+        return "Mild sympathetic dominance / Elevated system strain"
+    else:
+        return "Marked sympathetic dominance / Acute autonomic stress"
 
 
 def compute_hr_zones(rr_intervals):
@@ -228,12 +368,7 @@ def run_mode_readiness(rr, rr_ts):
 
     # LF/HF Balanced autonomic ratio interpretation
     lf_hf_val = f_metrics["lf_hf"]
-    if lf_hf_val < 2.0:
-        interp = "Balanced autonomic regulation (Parasympathetic / Sympathetic equilibrium)"
-    elif lf_hf_val <= 4.0:
-        interp = "Mild sympathetic dominance / Elevated system strain"
-    else:
-        interp = "Marked sympathetic dominance / Acute autonomic stress"
+    interp = interpret_lf_hf(lf_hf_val)
 
     # Terminal breakdown dashboard presentation
     log("\n── TIME DOMAIN & METRICS ──")
@@ -245,14 +380,21 @@ def run_mode_readiness(rr, rr_ts):
     log(f"  pNN50        : {t_metrics['pnn50']:.1f} %")
     log(f"  pNN200       : {t_metrics['pnn200']:.1f} %")
 
-    log("\n── FREQUENCY DOMAIN (WELCH PSD) ──")
+    log("\n── FREQUENCY DOMAIN (LOMB-SCARGLE) ──")
     log(f"  Total Power  : {f_metrics['total_power']:.1f} ms²")
-    log(f"  LF Power     : {f_metrics['lf_power']:.1f} ms²")
-    log(f"  HF Power     : {f_metrics['hf_power']:.1f} ms²")
+    log(f"  VLF Power    : {f_metrics['vlf_power']:.1f} ms²")
+    log(f"  LF Power     : {f_metrics['lf_power']:.1f} ms²  ({f_metrics['lf_nu']:.1f} nu)")
+    log(f"  HF Power     : {f_metrics['hf_power']:.1f} ms²  ({f_metrics['hf_nu']:.1f} nu)")
     log(f"  LF Peak      : {f_metrics['lf_peak']:.3f} Hz")
     log(f"  HF Peak      : {f_metrics['hf_peak']:.3f} Hz")
     log(f"  LF/HF Ratio  : {lf_hf_val:.2f}")
     log(f"  Interpretation: {interp}")
+
+    f_both = compute_frequency_metrics(rr_clean, method="both")
+    for m_name, m_data in f_both.items():
+        log(f"\n  [{m_name}] LF/HF={m_data['lf_hf']:.2f} | "
+            f"LF={m_data['lf_power']:.1f} | HF={m_data['hf_power']:.1f} | "
+            f"Total={m_data['total_power']:.1f}")
 
     log("\n── POINCARÉ GEOMETRY ──")
     log(f"  SD1 (Short)  : {sd1:.1f} ms")
