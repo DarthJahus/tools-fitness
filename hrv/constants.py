@@ -21,3 +21,5 @@ VLF_BAND = (0.00, 0.04)
 LF_BAND  = (0.04, 0.15)
 HF_BAND  = (0.15, 0.40)
 FS_RESAMPLE = 4.0          # Hz — Task Force 1996 standard
+
+DEFAULT_ZONE_BOUNDARIES = [112, 124, 136, 149, 161]

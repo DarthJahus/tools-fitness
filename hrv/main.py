@@ -42,6 +42,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     shared = _shared_parser()
+
+    zone_group = shared.add_mutually_exclusive_group()
+    zone_group.add_argument(
+        '--zones',
+        type=str,
+        help='Manual zone boundaries: X1,X2,X3,X4,X5 (default: 112,124,136,149,161)'
+    )
+    zone_group.add_argument(
+        '--max-hr',
+        type=int,
+        help='Maximum heart rate for automatic zone calculation (percentage method)'
+    )
+    zone_group.add_argument(
+        '--karvonen',
+        type=str,
+        help='Karvonen/Heart Rate Reserve method: RESTING,MAX (e.g., 60,185)'
+    )
+    zone_group.add_argument(
+        '--zones-age',
+        type=int,
+        help='Calculate max HR from age using 220-age formula, then compute zones'
+    )
+
+    # 2. CRÉER LES SOUS-PARSERS APRÈS (Ils hériteront ainsi correctement des zones)
     sub = root.add_subparsers(dest="mode", required=True, metavar="MODE",
                               help="night | readiness | exercise")
 
@@ -162,6 +186,7 @@ def _run_inner(args, custom_marker):
     # ── mode dispatch ─────────────────────────────────────────
     if args.mode == "night":
         run_mode_night(
+            args,
             rr, rr_ts, ecg, ts_ecg,
             window_min=args.window,
             hrv_detail=args.hrv_detail,
@@ -173,7 +198,8 @@ def _run_inner(args, custom_marker):
     elif args.mode == "readiness":
         run_mode_readiness(rr, rr_ts)
     elif args.mode == "exercise":
-        run_mode_exercise(rr, rr_ts, window_min=args.window)
+        run_mode_exercise(args, rr, rr_ts, window_min=args.window)
+
 
 def main():
     args, custom_marker = parse_args()

@@ -5,7 +5,7 @@ from datetime import timedelta
 import neurokit2 as nk
 from collections import Counter
 from matplotlib.patches import Patch
-from utils import log
+from utils import log, get_zones
 import numpy as np
 from scipy.signal import detrend, welch
 from scipy.interpolate import CubicSpline
@@ -100,8 +100,6 @@ def _empty_result() -> dict:
     }
 
 
-
-
 # ── Method 1 : Lomb-Scargle ───────────────────────────────────────────────────
 
 def _lomb_scargle(rr_ms: np.ndarray) -> dict:
@@ -141,7 +139,7 @@ def _lomb_scargle(rr_ms: np.ndarray) -> dict:
     # Variance is computed on the windowed, detrended signal in ms (not seconds)
     # so the resulting PSD will be in ms²/Hz, consistent with Welch output.
     rr_ms_dt = detrend(rr_ms, type="linear")
-    window_ms = np.hanning(len(rr_ms_dt))
+    #window_ms = np.hanning(len(rr_ms_dt))
     variance_ms2 = float(np.var(rr_ms_dt))
 
     df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
@@ -277,22 +275,14 @@ def interpret_lf_hf(ratio: float) -> str:
         return "Marked sympathetic dominance / Acute autonomic stress"
 
 
-def compute_hr_zones(rr_intervals):
+def compute_hr_zones(rr_intervals, zones_dict):
     """
-    Buckets instant HR calculated from each RR interval into specific zones.
+    Buckets instant HR calculated from each RR interval into dynamic zones.
     Returns a dict containing cumulative duration (minutes) and percentage for each zone.
     """
-    # Zone definitions (absolute boundaries in bpm)
-    # Zone 1: 101–117 bpm, Zone 2: 118–132 bpm, Zone 3: 133–148 bpm
-    # Zone 4: 149–161 bpm, Zone 5: >161 bpm, Rest: <101 bpm
-
+    # Initialize stats dynamically based on the provided zones_dict keys
     zones_stats = {
-        "Rest": {"count": 0, "duration_ms": 0.0},
-        "Zone 1": {"count": 0, "duration_ms": 0.0},
-        "Zone 2": {"count": 0, "duration_ms": 0.0},
-        "Zone 3": {"count": 0, "duration_ms": 0.0},
-        "Zone 4": {"count": 0, "duration_ms": 0.0},
-        "Zone 5": {"count": 0, "duration_ms": 0.0}
+        key: {"count": 0, "duration_ms": 0.0} for key in zones_dict
     }
 
     if len(rr_intervals) == 0:
@@ -301,21 +291,23 @@ def compute_hr_zones(rr_intervals):
     instant_hrs = 60000.0 / rr_intervals
 
     for hr, rr_ms in zip(instant_hrs, rr_intervals):
-        if hr < 101.0:
-            key = "Rest"
-        elif hr <= 117.0:
-            key = "Zone 1"
-        elif hr <= 132.0:
-            key = "Zone 2"
-        elif hr <= 148.0:
-            key = "Zone 3"
-        elif hr <= 161.0:
-            key = "Zone 4"
-        else:
-            key = "Zone 5"
+        assigned_key = None
 
-        zones_stats[key]["count"] += 1
-        zones_stats[key]["duration_ms"] += rr_ms
+        # Check matching zone from the dynamic dictionary
+        for key, (low, high, _) in zones_dict.items():
+            if low <= hr <= high:
+                assigned_key = key
+                break
+
+        # Fallback if HR falls slightly outside defined bounds (e.g., < Zone 0 or > Zone 5 limit)
+        if assigned_key is None:
+            if hr < list(zones_dict.values())[0][0]:
+                assigned_key = list(zones_dict.keys())[0]  # Zone 0
+            else:
+                assigned_key = list(zones_dict.keys())[-1]  # Zone 5
+
+        zones_stats[assigned_key]["count"] += 1
+        zones_stats[assigned_key]["duration_ms"] += rr_ms
 
     total_duration_ms = sum(z["duration_ms"] for z in zones_stats.values())
     results = {}
@@ -377,7 +369,8 @@ def run_mode_readiness(rr, rr_ts):
     interp = interpret_lf_hf(lf_hf_val)
 
     # Terminal breakdown dashboard presentation
-    log("\n── TIME DOMAIN & METRICS ──")
+    log()
+    log("── TIME DOMAIN & METRICS ──")
     log(f"  Mean RR      : {t_metrics['mean_rr']:.1f} ms")
     log(f"  HR Mean      : {hr_mean:.1f} bpm (Min: {hr_min:.1f} | Max: {hr_max:.1f})")
     log(f"  RMSSD        : {t_metrics['rmssd']:.1f} ms")
@@ -386,7 +379,8 @@ def run_mode_readiness(rr, rr_ts):
     log(f"  pNN50        : {t_metrics['pnn50']:.1f} %")
     log(f"  pNN200       : {t_metrics['pnn200']:.1f} %")
 
-    log("\n── FREQUENCY DOMAIN (LOMB-SCARGLE) ──")
+    log()
+    log("── FREQUENCY DOMAIN (LOMB-SCARGLE) ──")
     log(f"  Total Power  : {f_metrics['total_power']:.1f} ms²")
     log(f"  VLF Power    : {f_metrics['vlf_power']:.1f} ms²")
     log(f"  LF Power     : {f_metrics['lf_power']:.1f} ms²  ({f_metrics['lf_nu']:.1f} nu)")
@@ -402,20 +396,22 @@ def run_mode_readiness(rr, rr_ts):
     #        f"LF={m_data['lf_power']:.1f} | HF={m_data['hf_power']:.1f} | "
     #        f"Total={m_data['total_power']:.1f}")
 
-    log("\n── POINCARÉ GEOMETRY ──")
+    log()
+    log("── POINCARÉ GEOMETRY ──")
     log(f"  SD1 (Short)  : {sd1:.1f} ms")
     log(f"  SD2 (Long)   : {sd2:.1f} ms")
     log(f"  SD1/SD2 Ratio: {sd_ratio:.2f}")
 
     # Section 4 Required rapid-read output layout block
-    log("\n[summary]")
+    log()
+    log("[summary]")
     log(f"Readiness Status: RMSSD {t_metrics['rmssd']:.1f}ms | HR {hr_mean:.1f}bpm | LF/HF {lf_hf_val:.2f}")
     log(f"Autonomic Balance: {interp}")
     log(f"Ectopics Count: {ect_count} removed before metrics analysis loops.")
     log("─" * 60)
 
 
-def run_mode_exercise(rr, rr_ts, window_min=10):
+def run_mode_exercise(args, rr, rr_ts, window_min=10):
     """
     Exercise performance session analysis over uniform time segments.
     Provides per-segment breakdowns and a global session summary.
@@ -432,45 +428,56 @@ def run_mode_exercise(rr, rr_ts, window_min=10):
     ectopics = detect_ectopics(rr, rr_ts, window_beats=30)
     ect_set = set(ectopics["indices"].tolist()) if (ectopics and ectopics["count"] > 0) else set()
 
-    clean_mask  = np.array([i not in ect_set for i in range(len(rr))])
-    rr_clean    = rr[clean_mask]
+    clean_mask = np.array([i not in ect_set for i in range(len(rr))])
+    rr_clean = rr[clean_mask]
     rr_ts_clean = rr_ts[clean_mask]
 
     global_ect_count = len(rr) - len(rr_clean)
-    global_ect_rate  = (global_ect_count / len(rr) * 100.0) if len(rr) > 0 else 0.0
+    global_ect_rate = (global_ect_count / len(rr) * 100.0) if len(rr) > 0 else 0.0
+
+    if len(rr_clean) == 0:
+        log("[ERROR] No clean intervals remaining after ectopic removal.")
+        return
+
+    # ── Configuration des Zones de Fréquence Cardiaque ────────
+    # On extrait d'abord la FC Max réelle observée dans toutes les données nettoyées
+    data_max_hr = int(60000.0 / min(rr_clean))
+
+    # On génère la configuration des zones Garmin UNIQUE pour toute la session
+    session_zones_config = get_zones(args, data_max_hr=data_max_hr)
 
     # ── Per-segment loop ──────────────────────────────────────
     seg_duration = timedelta(minutes=window_min)
-    slice_start  = rr_ts_clean[0]
-    end_time     = rr_ts_clean[-1]
+    slice_start = rr_ts_clean[0]
+    end_time = rr_ts_clean[-1]
 
     segment_metrics = []
-    sliding_rmssds  = []
+    sliding_rmssds = []
 
-    log(f"\n  {'Segment Range':<20} | {'RMSSD':>8} | {'Avg HR':>7} | {'Ectopics':>8} | {'Primary Zone':<12}")
-    log("  " + "─" * 68)
+    # Ajustement de l'alignement de la colonne 'Primary Zone' (les noms Garmin sont plus longs)
+    log(f"\n  {'Segment Range':<16} | {'RMSSD':>9} | {'Avg HR':>9} | {'Ectopics':>8} | {'Primary Zone':<25}")
+    log("  " + "─" * 81)
 
     while slice_start < end_time:
         slice_end = slice_start + seg_duration
-        mask  = (rr_ts_clean >= slice_start) & (rr_ts_clean < slice_end)
-        w_rr  = rr_clean[mask]
+        mask = (rr_ts_clean >= slice_start) & (rr_ts_clean < slice_end)
+        w_rr = rr_clean[mask]
 
         if len(w_rr) >= 10:
-            diffs    = np.diff(w_rr)
-            w_rmssd  = np.sqrt(np.mean(diffs ** 2)) if len(diffs) > 0 else 0.0
+            diffs = np.diff(w_rr)
+            w_rmssd = np.sqrt(np.mean(diffs ** 2)) if len(diffs) > 0 else 0.0
             w_hr_avg = np.mean(60000.0 / w_rr)
             sliding_rmssds.append(w_rmssd)
 
             # Local ectopic count: beats present in raw window but absent after cleaning
             w_raw_count = int(np.sum((rr_ts >= slice_start) & (rr_ts < slice_end)))
-            w_ect       = max(0, w_raw_count - len(w_rr))
+            w_ect = max(0, w_raw_count - len(w_rr))
 
-            # Dominant zone for this segment
-            seg_zones = compute_hr_zones(w_rr)
-            seg_top   = max(seg_zones.items(), key=lambda x: x[1]["pct"])[0]
+            seg_zones = compute_hr_zones(w_rr, session_zones_config)
+            seg_top = max(seg_zones.items(), key=lambda x: x[1]["pct"])[0]
 
             label = f"{slice_start.strftime('%H:%M')}–{slice_end.strftime('%H:%M')}"
-            log(f"  {label:<20} | {w_rmssd:>6.1f} ms | {w_hr_avg:>4.1f} bpm | {w_ect:>8d} | {seg_top:<12}")
+            log(f"  {label:<16} | {w_rmssd:>6.1f} ms | {w_hr_avg:>5.1f} bpm | {w_ect:>8d} | {seg_top:<25}")
 
             segment_metrics.append({
                 "label": label, "rmssd": w_rmssd, "hr_avg": w_hr_avg, "ect": w_ect
@@ -479,13 +486,9 @@ def run_mode_exercise(rr, rr_ts, window_min=10):
         slice_start = slice_end
 
     # ── Session global aggregates ─────────────────────────────
-    if len(rr_clean) == 0:
-        log("[ERROR] No clean intervals remaining after ectopic removal.")
-        return
-
     global_hr_inst = 60000.0 / rr_clean
-    global_hr_avg  = float(np.mean(global_hr_inst))
-    global_hr_max  = float(np.max(global_hr_inst))
+    global_hr_avg = float(np.mean(global_hr_inst))
+    global_hr_max = float(np.max(global_hr_inst))
 
     rmssd_min = min(sliding_rmssds) if sliding_rmssds else 0.0
     rmssd_max = max(sliding_rmssds) if sliding_rmssds else 0.0
@@ -493,18 +496,21 @@ def run_mode_exercise(rr, rr_ts, window_min=10):
     tachy_beats = int(np.sum(global_hr_inst > 150.0))
     brady_beats = int(np.sum(global_hr_inst < 50.0))
     total_beats = len(rr_clean)
-    tachy_pct   = (tachy_beats / total_beats * 100.0) if total_beats > 0 else 0.0
-    brady_pct   = (brady_beats / total_beats * 100.0) if total_beats > 0 else 0.0
+    tachy_pct = (tachy_beats / total_beats * 100.0) if total_beats > 0 else 0.0
+    brady_pct = (brady_beats / total_beats * 100.0) if total_beats > 0 else 0.0
 
-    global_zones = compute_hr_zones(rr_clean)
+    global_zones = compute_hr_zones(rr_clean, session_zones_config)
 
     # ── HR zone distribution ──────────────────────────────────
-    log("\n── HEART RATE ZONE BREAKDOWN ──")
+    log()
+    log("── HEART RATE ZONE BREAKDOWN ──")
     for zone, stats in global_zones.items():
         bar = "█" * int(stats["pct"] / 5.0)
-        log(f"  {zone:<8} : {stats['minutes']:>5.1f} min ({stats['pct']:>5.1f}%) {bar}")
+        # Ajustement de l'alignement de la chaîne du nom de la zone à 25 caractères
+        log(f"  {zone:<32} : {stats['minutes']:>5.1f} min ({stats['pct']:>5.1f}%) {bar}")
 
-    log("\n── EXERCISE METRICS SUMMARY ──")
+    log()
+    log("── EXERCISE METRICS SUMMARY ──")
     log(f"  HR Mean/Max   : {global_hr_avg:.1f} / {global_hr_max:.1f} bpm")
     log(f"  RMSSD Range   : {rmssd_min:.1f} ms ── {rmssd_max:.1f} ms")
     log(f"  Beats >150bpm : {tachy_beats} ({tachy_pct:.1f}%)")
@@ -512,17 +518,18 @@ def run_mode_exercise(rr, rr_ts, window_min=10):
     log(f"  Total Ectopic : {global_ect_count} ({global_ect_rate:.2f}% of beats)")
 
     # ── Summary block ─────────────────────────────────────────
-    top_zone     = max(global_zones.items(), key=lambda x: x[1]["pct"])[0]
+    top_zone = max(global_zones.items(), key=lambda x: x[1]["pct"])[0]
     top_zone_pct = global_zones[top_zone]["pct"]
 
-    log("\n[summary]")
+    log()
+    log("[summary]")
     log(f"Workout Status: Avg HR {global_hr_avg:.1f}bpm | Peak {global_hr_max:.1f}bpm | RMSSD Max {rmssd_max:.1f}ms")
     log(f"Zone Dominance: {top_zone} ({top_zone_pct:.1f}%) — RMSSD Range {rmssd_min:.1f}–{rmssd_max:.1f}ms")
     log(f"Ectopics Profile: {global_ect_count} ({global_ect_rate:.2f}%) removed from timeline analysis.")
     log("─" * 60)
 
 
-def run_mode_night(rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sleep=False, no_gru=False, m_start=None, m_stop=None):
+def run_mode_night(args, rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sleep=False, no_gru=False, m_start=None, m_stop=None):
     """
     Executes standard overnight physiological sleep analysis protocol.
     Aggregates indicators by hour and tracks autonomic recovery.
@@ -568,7 +575,8 @@ def run_mode_night(rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sl
     hrv_min = min(rmssd) if rmssd else t_metrics["rmssd"]
     hrv_max = max(rmssd) if rmssd else t_metrics["rmssd"]
 
-    log("\n── OVERNIGHT RECOVERY METRICS ──")
+    log()
+    log("── OVERNIGHT RECOVERY METRICS ──")
     log(f"  RMSSD Average: {t_metrics['rmssd']:.1f} ms (Min Window: {hrv_min:.1f} | Max Window: {hrv_max:.1f})")
     log(f"  SDNN Global  : {t_metrics['sdnn']:.1f} ms")
     log(f"  HR Average   : {hr_mean:.1f} bpm")
@@ -582,11 +590,14 @@ def run_mode_night(rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sl
     log(f"  Overnight LF/HF Ratio: {f_metrics['lf_hf']:.2f}")
 
     # Process heart rate zones mapping for the sleep timeline
-    overnight_zones = compute_hr_zones(rr_clean)
-    log("\n── SLEEP ZONE DISTRIBUTION ──")
+    data_max_hr = int(60000.0 / min(rr_clean)) if len(rr_clean) > 0 else None
+    night_zones_config = get_zones(args, data_max_hr=data_max_hr)
+    overnight_zones = compute_hr_zones(rr_clean, night_zones_config)
+    log()
+    log("── SLEEP ZONE DISTRIBUTION ──")
     for zone, stats in overnight_zones.items():
         if stats["pct"] > 0.05:
-            log(f"  {zone:<8} : {stats['minutes']:>5.1f} min ({stats['pct']:>5.1f}%)")
+            log(f"  {zone:<32} : {stats['minutes']:>5.1f} min ({stats['pct']:>5.1f}%)")
 
     # Segment plot rendering if explicit markers are passed down
     if m_start and m_stop:
@@ -604,7 +615,8 @@ def run_mode_night(rr, rr_ts, ecg, ts_ecg, window_min=5, hrv_detail=False, no_sl
         run_hrv_detail(rr_clean, rr_ts_clean, m_start, m_stop)
 
     # Section 4 Required rapid-read output layout block
-    log("\n[summary]")
+    log()
+    log("[summary]")
     log(f"Night Summary: Mean RMSSD {t_metrics['rmssd']:.1f}ms (Range: {hrv_min:.1f}-{hrv_max:.1f}ms) | Avg HR {hr_mean:.1f}bpm")
     log(f"Autonomic Tone: LF/HF {f_metrics['lf_hf']:.2f} | pNN50 {t_metrics['pnn50']:.1f}% | Global SDNN {t_metrics['sdnn']:.1f}ms")
     log(f"Ectopics Profile: {ect_count} anomaly intervals isolated across sleep timeline.")
@@ -898,7 +910,8 @@ def hrv_by_hour(rr, rr_ts, ectopics=None):
                      "hr": hr_h, "ectopic_count": ect_count})
         h += timedelta(hours=1)
 
-    log("\n[hrv] ── HRV BY HOUR ────────────────────────────────")
+    log()
+    log("[hrv] ── HRV BY HOUR ────────────────────────────────")
     log(f"  {'Hour':>6}  {'RMSSD':>7}  {'HR':>7}  {'Ectopics':>9}")
     for r in rows:
         log(f"  {r['hour']:>6}  {r['rmssd']:>7.1f}  {r['hr']:>7.1f}  {r['ectopic_count']:>9}")
@@ -989,7 +1002,8 @@ def run_hrv_detail(rr, rr_ts, m_start, m_stop):
         return
 
     # ── Aggregate by hour ────────────────────────────────────
-    log("\n[hrv-detail] ── HRV DETAIL BY HOUR ─────────────────")
+    log()
+    log("[hrv-detail] ── HRV DETAIL BY HOUR ─────────────────")
     log(f"  {'Hour':>6}  {'RMSSD':>7}  {'SDNN':>7}  {'pNN50':>7}  {'DFAα1':>7}")
 
     by_hour: dict = {}
@@ -1046,13 +1060,15 @@ def ectopics_by_stage(ectopics, epochs_ts, labels):
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
 
     parts = "  ".join(f"{s}: {stage_counts.get(s, 0)}" for s in sorted(set(labels)))
-    log(f"\n[ectopic] ectopic distribution by sleep stage: {parts}")
+    log()
+    log(f"[ectopic] ectopic distribution by sleep stage: {parts}")
 
 
 def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr, ectopics=None):
     epoch_td = timedelta(seconds=EPOCH_S)
 
-    log("\n[sleep] rule-based sleep staging (30s epochs)")
+    log()
+    log("[sleep] rule-based sleep staging (30s epochs)")
     log(f"[sleep] {len(rr):,} RR intervals available")
 
     epochs_ts, labels = [], []
@@ -1122,8 +1138,7 @@ def sleep_staging_rule_based(rr, rr_ts, times, rmssd, hr, ectopics=None):
     ax1b.set_ylabel("HR (bpm)", color="tab:red")
 
     patches = [Patch(color=stage_colors[l], label=l) for l in stage_labels_order]
-    ax1.legend(handles=patches + ax1.get_lines() + ax1b.get_lines(),
-               loc="upper right", fontsize=8)
+    ax1.legend(handles=patches + ax1.get_lines() + ax1b.get_lines(), loc="upper right", fontsize=8)
 
     stage_y = {"WAKE": 4, "REM": 3, "N1": 2, "N2": 1, "N3": 0}
     y_vals  = [stage_y[l] for l in labels]
@@ -1152,7 +1167,8 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr, ectopics=None):
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
     logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-    log("\n[sleep] detecting heartbeats (Pan-Tompkins)…")
+    log()
+    log("[sleep] detecting heartbeats (Pan-Tompkins)…")
     beats = sleepecg.detect_heartbeats(ecg, sr)
     log(f"[sleep] beats detected: {len(beats):,}")
 
@@ -1243,5 +1259,3 @@ def sleep_staging(ecg, sr, ts_ecg, times, rmssd, hr, ectopics=None):
 
     # F4: ectopics per sleep stage
     ectopics_by_stage(ectopics, epoch_times, labels_str)
-
-# ─────────────────────────────────────────────────────────────
